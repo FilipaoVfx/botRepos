@@ -1,0 +1,24 @@
+{
+  "name": "telegram-rag-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bot de Telegram + CLI RAG sobre bookmarks y READMEs de GitHub (Pinecone + OpenAI + Supabase)",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/telegram-bot.js start",
+    "search": "node src/rag-orchestrator.js",
+    "ingest": "node src/rag-ingest.js all",
+    "ingest:bookmarks": "node src/rag-ingest.js bookmarks",
+    "ingest:readmes": "node src/rag-ingest.js readmes"
+  },
+  "dependencies": {
+    "@pinecone-database/pinecone": "^4.0.0",
+    "@supabase/supabase-js": "^2.103.0",
+    "dotenv": "^17.4.1",
+    "openai": "^4.50.0",
+    "telegraf": "^4.16.0"
+  }
+}
