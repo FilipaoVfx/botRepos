@@ -1,7 +1,32 @@
-import { ragSearch } from "./rag-orchestrator.js";
+import os from "os";
+import { ragSearch, getKnowledgeStats } from "./rag-orchestrator.js";
+import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
 
 let bot = null;
 let botUsername = "";
+const BOT_STARTED_AT = Date.now();
+
+// List of commands shown in the Telegram "/" menu (registered via setMyCommands)
+const BOT_COMMANDS = [
+  { command: "search", description: "Buscar en bookmarks y READMEs" },
+  { command: "filter", description: "Filtrar: /filter <bookmark|readme> <query>" },
+  { command: "status", description: "Estado del bot y del hosting" },
+  { command: "data", description: "Estadísticas de la base de conocimiento" },
+  { command: "help", description: "Mostrar ayuda" },
+];
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const parts = [];
+  if (d) parts.push(`${d}d`);
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  parts.push(`${s % 60}s`);
+  return parts.join(" ");
+}
 
 function getBot() {
   if (bot) return bot;
@@ -17,6 +42,14 @@ function getBot() {
     // Get bot username for group mentions
     const me = await bot.telegram.getMe();
     botUsername = me.username;
+
+    // Register the command menu so Telegram's "/" button shows all commands
+    try {
+      await bot.telegram.setMyCommands(BOT_COMMANDS);
+      console.log("[Telegram] Command menu registered");
+    } catch (err) {
+      console.error("[Telegram] Failed to register commands:", err.message);
+    }
 
     return bot;
   });
@@ -83,6 +116,8 @@ export async function startTelegramBot() {
         "/search <query> — Buscar en bookmarks y READMEs\n" +
         "/filter bookmark <query> — Buscar solo en bookmarks\n" +
         "/filter readme <query> — Buscar solo en READMEs\n" +
+        "/status — Estado del bot y del hosting\n" +
+        "/data — Estadísticas de la base de conocimiento\n" +
         "/help — Mostrar ayuda\n\n" +
         "*Ejemplos:*\n" +
         "→ react hooks patterns\n" +
@@ -99,7 +134,9 @@ export async function startTelegramBot() {
         "*Comandos:*\n" +
         "/search <query> — Buscar en bookmarks y READMEs\n" +
         "/filter bookmark <query> — Buscar solo en bookmarks\n" +
-        "/filter readme <query> — Buscar solo en READMEs\n\n" +
+        "/filter readme <query> — Buscar solo en READMEs\n" +
+        "/status — Estado del bot y del hosting\n" +
+        "/data — Estadísticas de la base de conocimiento\n\n" +
         "*En grupos:*\n" +
         "Menciona al bot: @tu_bot \"query\"\n" +
         "O responde a un mensaje del bot\n\n" +
@@ -144,6 +181,86 @@ export async function startTelegramBot() {
     try {
       const results = await ragSearch(query, { topK: 5, sourceType, interface: "telegram" });
       ctx.reply(formatTelegramResults(results), { parse_mode: "Markdown" });
+    } catch (err) {
+      ctx.reply(`❌ Error: ${err.message}`);
+    }
+  });
+
+  // /status — bot + hosting info
+  telegramBot.command("status", async (ctx) => {
+    await ctx.replyWithChatAction("typing");
+
+    const mem = process.memoryUsage();
+    const totalMemGb = (os.totalmem() / 1024 ** 3).toFixed(1);
+    const freeMemGb = (os.freemem() / 1024 ** 3).toFixed(1);
+    const load = os.loadavg().map((n) => n.toFixed(2)).join(", ");
+    const hostLabel = process.env.HOST_LABEL || "VPS (self-hosted)";
+
+    // Probe backing services
+    let pineconeStatus = "🔴 error";
+    let pineconeVectors = "?";
+    try {
+      const stats = await getPineconeStats();
+      pineconeVectors = stats.totalRecordCount ?? stats.totalVectorCount ?? "?";
+      pineconeStatus = "🟢 conectado";
+    } catch {
+      pineconeStatus = "🔴 sin conexión";
+    }
+
+    let supabaseStatus = "🔴 error";
+    try {
+      const ks = await getKnowledgeStats();
+      supabaseStatus = ks.error ? "🔴 error" : "🟢 conectado";
+    } catch {
+      supabaseStatus = "🔴 sin conexión";
+    }
+
+    const { indexName } = getPineconeConfig();
+
+    const msg =
+      "🤖 *Estado del bot*\n" +
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+      "🟢 *Bot:* online\n" +
+      `⏱️ *Uptime proceso:* ${formatUptime(Date.now() - BOT_STARTED_AT)}\n\n` +
+      "*🖥️ Hosting*\n" +
+      `   📍 Entorno: ${hostLabel}\n` +
+      `   🏷️ Host: \`${os.hostname()}\`\n` +
+      `   ⚙️ SO: ${os.type()} ${os.release()} (${os.arch()})\n` +
+      `   🟩 Node: ${process.version}\n` +
+      `   ⏳ Uptime host: ${formatUptime(os.uptime() * 1000)}\n` +
+      `   📈 Carga (1/5/15m): ${load}\n` +
+      `   🧠 RAM host: ${freeMemGb} GB libre / ${totalMemGb} GB\n` +
+      `   💾 RAM proceso: ${(mem.rss / 1024 ** 2).toFixed(0)} MB\n\n` +
+      "*🔌 Servicios*\n" +
+      `   🌲 Pinecone (${indexName}): ${pineconeStatus} — ${pineconeVectors} vectores\n` +
+      `   🗄️ Supabase: ${supabaseStatus}`;
+
+    ctx.reply(msg, { parse_mode: "Markdown" });
+  });
+
+  // /data — knowledge base statistics
+  telegramBot.command("data", async (ctx) => {
+    await ctx.replyWithChatAction("typing");
+
+    try {
+      const [ks, pineStats] = await Promise.all([
+        getKnowledgeStats(),
+        getPineconeStats().catch(() => null),
+      ]);
+
+      const vectors =
+        pineStats?.totalRecordCount ?? pineStats?.totalVectorCount ?? "?";
+
+      const msg =
+        "📊 *Base de conocimiento*\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `🔖 Bookmarks: *${ks.bookmarks}*\n` +
+        `📦 READMEs indexados: *${ks.readmes}*\n` +
+        `🧬 Vectores en Pinecone: *${vectors}*\n` +
+        `🔍 Consultas totales: *${ks.queries}*` +
+        (ks.error ? `\n\n⚠️ _${ks.error}_` : "");
+
+      ctx.reply(msg, { parse_mode: "Markdown" });
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
     }

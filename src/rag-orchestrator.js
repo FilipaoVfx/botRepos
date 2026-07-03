@@ -73,6 +73,25 @@ export async function ragSearch(query, options = {}) {
   };
 }
 
+// ─── Knowledge Base Stats ────────────────────────────────────────────
+
+export async function getKnowledgeStats() {
+  const db = getSupabase();
+
+  const [bookmarks, readmes, queries] = await Promise.all([
+    db.from("bookmarks").select("*", { count: "exact", head: true }),
+    db.from("github_repo_readmes").select("*", { count: "exact", head: true }),
+    db.from("rag_queries_log").select("*", { count: "exact", head: true }),
+  ]);
+
+  return {
+    bookmarks: bookmarks.count ?? 0,
+    readmes: readmes.count ?? 0,
+    queries: queries.count ?? 0,
+    error: bookmarks.error?.message || readmes.error?.message || queries.error?.message || null,
+  };
+}
+
 // ─── Batch Enrichment (2 queries total, vs 5-sequential) ────────────
 
 async function batchEnrichResults(matches) {
