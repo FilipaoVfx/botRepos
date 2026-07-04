@@ -73,6 +73,139 @@ export async function ragSearch(query, options = {}) {
   };
 }
 
+// ─── Repos: list, semantic search, detail ────────────────────────────
+
+// List all indexed repos (github_repo_readmes) with pagination.
+export async function listRepos({ page = 1, pageSize = 5 } = {}) {
+  const db = getSupabase();
+  const safePage = Math.max(1, page);
+  const from = (safePage - 1) * pageSize;
+  const to = from + pageSize - 1;
+
+  const { data, count, error } = await db
+    .from("github_repo_readmes")
+    .select("repo_slug, owner, repo, repo_url, content_chars, fetched_at", {
+      count: "exact",
+    })
+    .eq("status", "ok")
+    .order("fetched_at", { ascending: false })
+    .range(from, to);
+
+  if (error) throw error;
+
+  const total = count ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  return {
+    repos: data || [],
+    total,
+    page: safePage,
+    pageSize,
+    totalPages,
+  };
+}
+
+// Semantic search restricted to repos only (source_type = readme).
+// Dedupes chunk-level matches down to unique repos, keeping the best score.
+export async function searchRepos(query, { topK = 5 } = {}) {
+  const startedAt = Date.now();
+  const queryEmbedding = await getCachedEmbedding(query);
+
+  // Over-fetch chunks so that after de-duplication we still have enough repos.
+  const matches = await queryVectors(queryEmbedding, {
+    topK: topK * 5,
+    filter: { source_type: "readme" },
+  });
+
+  const bySlug = new Map();
+  for (const match of matches) {
+    const slug = match.metadata?.item_id;
+    if (!slug) continue;
+    const score = match.score || 0;
+    if (!bySlug.has(slug) || score > bySlug.get(slug).score) {
+      bySlug.set(slug, {
+        repo_slug: slug,
+        score,
+        url: match.metadata?.url || `https://github.com/${slug}`,
+      });
+    }
+  }
+
+  const repos = [...bySlug.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
+
+  logQuery(query, "telegram-repo", repos.length, Date.now() - startedAt).catch(
+    () => {}
+  );
+
+  return {
+    query,
+    results: repos,
+    total: repos.length,
+    latency_ms: Date.now() - startedAt,
+  };
+}
+
+// Full metadata for a single repo + the origin post(s) that referenced it.
+export async function getRepoDetail(slug) {
+  const db = getSupabase();
+
+  const { data: repo, error } = await db
+    .from("github_repo_readmes")
+    .select(
+      "repo_slug, owner, repo, repo_url, readme_html_url, content_chars, size_bytes, status, fetched_at, created_at"
+    )
+    .eq("repo_slug", slug)
+    .single();
+
+  if (error || !repo) return null;
+
+  const origins = await findRepoOrigins(slug, repo.repo_url);
+  return { repo, origins };
+}
+
+// Find the bookmark(s) (origin posts) whose links reference this repo.
+async function findRepoOrigins(slug, repoUrl) {
+  const db = getSupabase();
+
+  const base = `https://github.com/${slug}`;
+  const variants = [
+    ...new Set([base, `${base}/`, repoUrl, repoUrl && `${repoUrl}/`].filter(Boolean)),
+  ];
+
+  const seen = new Map();
+  const addRows = (rows) => {
+    for (const r of rows || []) if (!seen.has(r.id)) seen.set(r.id, r);
+  };
+
+  const cols = "id, source_url, author_username, author_name, text_content, created_at";
+
+  // Match on the links array and the first-comment links array.
+  for (const field of ["links", "first_comment_links"]) {
+    const { data } = await db
+      .from("bookmarks")
+      .select(cols)
+      .overlaps(field, variants)
+      .limit(5);
+    addRows(data);
+  }
+
+  // Fallback: the repo URL mentioned inline in the tweet text.
+  if (seen.size === 0) {
+    const { data } = await db
+      .from("bookmarks")
+      .select(cols)
+      .ilike("text_content", `%github.com/${slug}%`)
+      .limit(5);
+    addRows(data);
+  }
+
+  return [...seen.values()]
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+    .slice(0, 5);
+}
+
 // ─── Knowledge Base Stats ────────────────────────────────────────────
 
 export async function getKnowledgeStats() {

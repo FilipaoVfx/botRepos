@@ -1,6 +1,32 @@
 import os from "os";
-import { ragSearch, getKnowledgeStats } from "./rag-orchestrator.js";
+import {
+  ragSearch,
+  getKnowledgeStats,
+  listRepos,
+  searchRepos,
+  getRepoDetail,
+} from "./rag-orchestrator.js";
 import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
+
+const REPOS_PAGE_SIZE = 5;
+
+// Map short ids <-> repo slugs so inline-button callback_data stays well under
+// Telegram's 64-byte limit even for long owner/repo slugs.
+const slugById = new Map();
+const idBySlug = new Map();
+let slugSeq = 0;
+function idForSlug(slug) {
+  if (idBySlug.has(slug)) return idBySlug.get(slug);
+  const id = (slugSeq++).toString(36);
+  idBySlug.set(slug, id);
+  slugById.set(id, slug);
+  return id;
+}
+
+// Escape the few characters that break Telegram legacy Markdown.
+function escapeMd(s) {
+  return String(s ?? "").replace(/([_*`[\]])/g, "\\$1");
+}
 
 let bot = null;
 let botUsername = "";
@@ -10,6 +36,8 @@ const BOT_STARTED_AT = Date.now();
 const BOT_COMMANDS = [
   { command: "search", description: "Buscar en bookmarks y READMEs" },
   { command: "filter", description: "Filtrar: /filter <bookmark|readme> <query>" },
+  { command: "repos", description: "Listar todos los repositorios" },
+  { command: "buscar_repo", description: "Búsqueda semántica solo de repos" },
   { command: "status", description: "Estado del bot y del hosting" },
   { command: "data", description: "Estadísticas de la base de conocimiento" },
   { command: "help", description: "Mostrar ayuda" },
@@ -100,6 +128,113 @@ function formatTelegramResults(results) {
   return response;
 }
 
+// ─── Repos: list page ────────────────────────────────────────────────
+
+async function buildReposPage(page) {
+  const { repos, total, page: p, totalPages } = await listRepos({
+    page,
+    pageSize: REPOS_PAGE_SIZE,
+  });
+
+  let text =
+    `📦 *Repositorios indexados* — ${total} en total\n` +
+    `Página ${p}/${totalPages}\n` +
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+
+  const detailRow = [];
+  if (repos.length === 0) {
+    text += "_No hay repositorios._";
+  } else {
+    repos.forEach((r, i) => {
+      const n = (p - 1) * REPOS_PAGE_SIZE + i + 1;
+      const url = r.repo_url || `https://github.com/${r.repo_slug}`;
+      text += `*${n}.* [${escapeMd(r.repo_slug)}](${url})\n`;
+      const chars = r.content_chars ? `📝 ${r.content_chars} chars` : "";
+      if (chars) text += `      ${chars}\n`;
+      detailRow.push({
+        text: `🔎 ${i + 1}`,
+        callback_data: `rd:${idForSlug(r.repo_slug)}`,
+      });
+    });
+  }
+
+  const nav = [];
+  if (p > 1) nav.push({ text: "⬅️ Anterior", callback_data: `rp:${p - 1}` });
+  nav.push({ text: `${p}/${totalPages}`, callback_data: "noop" });
+  if (p < totalPages) nav.push({ text: "Siguiente ➡️", callback_data: `rp:${p + 1}` });
+
+  const inline_keyboard = [detailRow, nav].filter((row) => row.length > 0);
+  return { text, keyboard: { inline_keyboard } };
+}
+
+// ─── Repos: semantic search results ──────────────────────────────────
+
+function buildRepoSearchText(results) {
+  let text =
+    `🔎 _${escapeMd(results.query)}_\n` +
+    `📦 ${results.total} repos | ${results.latency_ms}ms\n` +
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+
+  if (results.results.length === 0) {
+    text += "No se encontraron repositorios.";
+    return text;
+  }
+
+  results.results.forEach((r, i) => {
+    const score = (r.score * 100).toFixed(0);
+    text +=
+      `📦 *${i + 1}.* [${escapeMd(r.repo_slug)}](${r.url})\n` +
+      `      📊 ${score}% relevancia\n\n`;
+  });
+
+  return text;
+}
+
+function buildRepoSearchKeyboard(results) {
+  const row = results.results.map((r, i) => ({
+    text: `🔎 ${i + 1}`,
+    callback_data: `rd:${idForSlug(r.repo_slug)}`,
+  }));
+  return row.length ? { inline_keyboard: [row] } : undefined;
+}
+
+// ─── Repos: detail (metadata + origin post) ──────────────────────────
+
+function buildRepoDetail({ repo, origins }) {
+  const url = repo.repo_url || `https://github.com/${repo.repo_slug}`;
+
+  let text =
+    `📦 *${escapeMd(repo.repo_slug)}*\n` +
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+    `👤 Owner: ${escapeMd(repo.owner || "—")}\n` +
+    `📂 Repo: ${escapeMd(repo.repo || "—")}\n` +
+    `🔗 [Ver en GitHub](${url})\n`;
+
+  if (repo.readme_html_url) text += `📄 [README](${repo.readme_html_url})\n`;
+
+  const sizeKb = repo.size_bytes ? ` · ${(repo.size_bytes / 1024).toFixed(1)} KB` : "";
+  text += `📝 README: ${repo.content_chars ?? "?"} chars${sizeKb}\n`;
+  if (repo.fetched_at) {
+    text += `📅 Indexado: ${new Date(repo.fetched_at).toLocaleDateString("es-ES")}\n`;
+  }
+
+  text += "\n*📌 Post(s) de origen*\n";
+  if (!origins || origins.length === 0) {
+    text += "_No se encontró el post de origen._";
+  } else {
+    origins.forEach((o, i) => {
+      const author = o.author_username ? `@${o.author_username}` : o.author_name || "?";
+      text += `${i + 1}. 👤 ${escapeMd(author)}`;
+      if (o.source_url) text += ` — [Abrir post](${o.source_url})`;
+      text += "\n";
+      const snippet = (o.text_content || "").replace(/\s+/g, " ").trim().slice(0, 140);
+      if (snippet) text += `      📝 ${escapeMd(snippet)}\n`;
+    });
+  }
+
+  return text;
+}
+
 export async function startTelegramBot() {
   const telegramBot = await getBot();
 
@@ -116,6 +251,8 @@ export async function startTelegramBot() {
         "/search <query> — Buscar en bookmarks y READMEs\n" +
         "/filter bookmark <query> — Buscar solo en bookmarks\n" +
         "/filter readme <query> — Buscar solo en READMEs\n" +
+        "/repos — Listar todos los repositorios (paginado)\n" +
+        "/buscar_repo <query> — Búsqueda semántica solo de repos\n" +
         "/status — Estado del bot y del hosting\n" +
         "/data — Estadísticas de la base de conocimiento\n" +
         "/help — Mostrar ayuda\n\n" +
@@ -135,6 +272,8 @@ export async function startTelegramBot() {
         "/search <query> — Buscar en bookmarks y READMEs\n" +
         "/filter bookmark <query> — Buscar solo en bookmarks\n" +
         "/filter readme <query> — Buscar solo en READMEs\n" +
+        "/repos — Listar todos los repositorios (paginado)\n" +
+        "/buscar_repo <query> — Búsqueda semántica solo de repos\n" +
         "/status — Estado del bot y del hosting\n" +
         "/data — Estadísticas de la base de conocimiento\n\n" +
         "*En grupos:*\n" +
@@ -181,6 +320,83 @@ export async function startTelegramBot() {
     try {
       const results = await ragSearch(query, { topK: 5, sourceType, interface: "telegram" });
       ctx.reply(formatTelegramResults(results), { parse_mode: "Markdown" });
+    } catch (err) {
+      ctx.reply(`❌ Error: ${err.message}`);
+    }
+  });
+
+  // /repos — paginated list of all indexed repos
+  telegramBot.command("repos", async (ctx) => {
+    await ctx.replyWithChatAction("typing");
+    try {
+      const { text, keyboard } = await buildReposPage(1);
+      ctx.reply(text, {
+        parse_mode: "Markdown",
+        reply_markup: keyboard,
+        disable_web_page_preview: true,
+      });
+    } catch (err) {
+      ctx.reply(`❌ Error: ${err.message}`);
+    }
+  });
+
+  // Pagination for /repos (edits the same message)
+  telegramBot.action(/^rp:(\d+)$/, async (ctx) => {
+    const page = parseInt(ctx.match[1], 10);
+    try {
+      const { text, keyboard } = await buildReposPage(page);
+      await ctx.editMessageText(text, {
+        parse_mode: "Markdown",
+        reply_markup: keyboard,
+        disable_web_page_preview: true,
+      });
+    } catch {
+      // Ignore "message is not modified" and similar edit errors
+    }
+    ctx.answerCbQuery().catch(() => {});
+  });
+
+  // Page-indicator button — no-op
+  telegramBot.action("noop", (ctx) => ctx.answerCbQuery().catch(() => {}));
+
+  // /buscar_repo — semantic search restricted to repos only
+  telegramBot.command("buscar_repo", async (ctx) => {
+    const query = ctx.message.text.replace(/^\/buscar_repo(@\w+)?/, "").trim();
+    if (!query) {
+      return ctx.reply("Uso: /buscar_repo <consulta>");
+    }
+
+    await ctx.replyWithChatAction("typing");
+
+    try {
+      const results = await searchRepos(query, { topK: 5 });
+      ctx.reply(buildRepoSearchText(results), {
+        parse_mode: "Markdown",
+        reply_markup: buildRepoSearchKeyboard(results),
+        disable_web_page_preview: true,
+      });
+    } catch (err) {
+      ctx.reply(`❌ Error: ${err.message}`);
+    }
+  });
+
+  // Repo detail (metadata + origin post) triggered by the 🔎 detail buttons
+  telegramBot.action(/^rd:(.+)$/, async (ctx) => {
+    ctx.answerCbQuery().catch(() => {});
+    const slug = slugById.get(ctx.match[1]);
+    if (!slug) {
+      return ctx.reply("⚠️ Sesión expirada. Vuelve a listar o buscar los repos.");
+    }
+
+    await ctx.replyWithChatAction("typing");
+
+    try {
+      const detail = await getRepoDetail(slug);
+      if (!detail) return ctx.reply("⚠️ Repositorio no encontrado.");
+      ctx.reply(buildRepoDetail(detail), {
+        parse_mode: "Markdown",
+        disable_web_page_preview: true,
+      });
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
     }
