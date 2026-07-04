@@ -4,6 +4,12 @@ dotenv.config();
 import { createClient } from "@supabase/supabase-js";
 import { queryVectors } from "./rag-pinecone.js";
 import { getEmbeddingDetailed } from "./rag-openai.js";
+import {
+  spoolEvent,
+  flushEvents,
+  startEventFlusher,
+  pendingEventCount,
+} from "./event-log.js";
 
 let supabase = null;
 
@@ -139,8 +145,10 @@ export async function listRepos({ page = 1, pageSize = 5 } = {}) {
   const total = count ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
+  const repos = await attachTrustScores(data || [], (r) => r.repo_slug);
+
   return {
-    repos: data || [],
+    repos,
     total,
     page: safePage,
     pageSize,
@@ -182,6 +190,8 @@ export async function searchRepos(query, { topK = 5, user = null } = {}) {
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
 
+  await attachTrustScores(repos, (r) => r.repo_slug);
+
   const responseTime = Date.now() - startedAt;
 
   logEvent({
@@ -220,8 +230,12 @@ export async function getRepoDetail(slug) {
 
   if (error || !repo) return null;
 
-  const origins = await findRepoOrigins(slug, repo.repo_url);
-  return { repo, origins };
+  const [origins, engagement] = await Promise.all([
+    findRepoOrigins(slug, repo.repo_url),
+    getTrustScore(slug),
+  ]);
+  repo.trust_score = engagement ? Number(engagement.trust_score) : null;
+  return { repo, origins, engagement };
 }
 
 // Find the bookmark(s) (origin posts) whose links reference this repo.
@@ -265,22 +279,100 @@ async function findRepoOrigins(slug, repoUrl) {
     .slice(0, 5);
 }
 
+// ─── Trust Score (engagement de Twitter por repo) ────────────────────
+// El score mide la confiabilidad de un repo por la interacción real que generó
+// en Twitter (likes/saves/engagement/menciones/impresiones). La fórmula vive en
+// un único sitio — la usan el importador de CSV y cualquier recálculo en vivo —
+// y está versionada para poder recomputar sin ambigüedad. Escala 0.00–10.00.
+// Detalle y pesos: trust_score.md.
+export const TRUST_SCORE_VERSION = 1;
+
+export function computeTrustScore(m = {}) {
+  const score =
+    Math.min((Number(m.avg_likes) || 0) / 50, 10) * 0.25 +
+    Math.min((Number(m.avg_saves) || 0) / 10, 10) * 0.2 +
+    Math.min(Number(m.mentions_count) || 0, 10) * 0.15 +
+    Math.min((Number(m.avg_engagement_rate) || 0) * 10, 10) * 0.25 +
+    Math.min((Number(m.avg_impressions) || 0) / 5000, 10) * 0.15;
+  return Math.round(score * 100) / 100; // 0.00 – 10.00
+}
+
+// Batch-fetch engagement metrics for a set of repo slugs → Map(slug → row).
+// One round-trip; missing repos simply aren't in the map.
+export async function getTrustScores(slugs = []) {
+  const unique = [...new Set(slugs.filter(Boolean))];
+  if (!unique.length) return new Map();
+  const db = getSupabase();
+  const { data, error } = await db
+    .from("repo_engagement_metrics")
+    .select(
+      "repo_slug, trust_score, mentions_count, avg_likes, avg_saves, avg_engagement_rate, avg_impressions, trust_score_version, updated_at"
+    )
+    .in("repo_slug", unique);
+  if (error) return new Map(); // non-critical: repos just render without a score
+  return new Map((data || []).map((r) => [r.repo_slug, r]));
+}
+
+// Single repo's engagement metrics (or null).
+export async function getTrustScore(slug) {
+  return (await getTrustScores([slug])).get(slug) || null;
+}
+
+// Attach `trust_score` (and the raw metrics under `engagement`) to a list of
+// repo-shaped objects. Non-destructive: repos without metrics get trust_score
+// = null. `slugOf` maps an item to its repo_slug.
+async function attachTrustScores(items, slugOf) {
+  if (!items || !items.length) return items;
+  const scores = await getTrustScores(items.map(slugOf));
+  for (const it of items) {
+    const m = scores.get(slugOf(it));
+    it.trust_score = m ? Number(m.trust_score) : null;
+    it.engagement = m || null;
+  }
+  return items;
+}
+
+// Leaderboard: top repos by trust_score, joined with readme metadata via the FK.
+export async function getTopReposByTrust({ limit = 10 } = {}) {
+  const db = getSupabase();
+  const { data, error } = await db
+    .from("repo_engagement_metrics")
+    .select(
+      "repo_slug, trust_score, mentions_count, avg_likes, avg_engagement_rate, github_repo_readmes(owner, repo, repo_url)"
+    )
+    .order("trust_score", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return (data || []).map((r) => ({
+    repo_slug: r.repo_slug,
+    trust_score: Number(r.trust_score),
+    mentions_count: r.mentions_count,
+    avg_likes: Number(r.avg_likes),
+    avg_engagement_rate: Number(r.avg_engagement_rate),
+    owner: r.github_repo_readmes?.owner ?? null,
+    repo: r.github_repo_readmes?.repo ?? null,
+    repo_url: r.github_repo_readmes?.repo_url ?? null,
+  }));
+}
+
 // ─── Knowledge Base Stats ────────────────────────────────────────────
 
 export async function getKnowledgeStats() {
   const db = getSupabase();
 
-  const [bookmarks, readmes, queries] = await Promise.all([
+  const [bookmarks, readmes, events, legacy] = await Promise.all([
     db.from("bookmarks").select("*", { count: "exact", head: true }),
     db.from("github_repo_readmes").select("*", { count: "exact", head: true }),
     db.from("events").select("*", { count: "exact", head: true }),
+    db.from("rag_queries_log").select("*", { count: "exact", head: true }),
   ]);
 
   return {
     bookmarks: bookmarks.count ?? 0,
     readmes: readmes.count ?? 0,
-    queries: queries.count ?? 0,
-    error: bookmarks.error?.message || readmes.error?.message || queries.error?.message || null,
+    // Total queries ever = new events + frozen historical log.
+    queries: (events.count ?? 0) + (legacy.count ?? 0),
+    error: bookmarks.error?.message || readmes.error?.message || events.error?.message || null,
   };
 }
 
@@ -302,17 +394,46 @@ export async function getQueryAnalytics({ windowDays = 7, topN = 10 } = {}) {
   const now = Date.now();
   const since = new Date(now - windowDays * 86400_000).toISOString();
 
-  const { data, error } = await db
-    .from("events")
-    .select(
-      "query, interface, results_count, response_time, embedding_time, retrieval_time, tokens, cost, user_id, username, created_at"
-    )
-    .gte("created_at", since)
-    .order("created_at", { ascending: false })
-    .limit(5000);
+  // Read from `events` (current source of truth) AND the frozen historical
+  // `rag_queries_log`, merged. Nothing is written to rag_queries_log anymore, so
+  // the two sets are disjoint — the union restores pre-migration history without
+  // any double counting. If the legacy table is gone, we just skip it.
+  const [evRes, oldRes] = await Promise.all([
+    db
+      .from("events")
+      .select(
+        "query, interface, results_count, response_time, embedding_time, retrieval_time, tokens, cost, user_id, username, created_at"
+      )
+      .gte("created_at", since)
+      .order("created_at", { ascending: false })
+      .limit(5000),
+    db
+      .from("rag_queries_log")
+      .select("query, interface, results_count, latency_ms, created_at")
+      .gte("created_at", since)
+      .order("created_at", { ascending: false })
+      .limit(5000),
+  ]);
 
-  if (error) throw error;
-  const rows = data || [];
+  if (evRes.error) throw evRes.error;
+
+  const legacy = (oldRes.error ? [] : oldRes.data || []).map((r) => ({
+    query: r.query,
+    interface: r.interface,
+    results_count: r.results_count,
+    response_time: r.latency_ms,
+    embedding_time: 0,
+    retrieval_time: 0,
+    tokens: 0,
+    cost: 0,
+    user_id: null,
+    username: null,
+    created_at: r.created_at,
+  }));
+
+  const rows = [...(evRes.data || []), ...legacy]
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, 5000);
 
   const ms24 = now - 86400_000;
   const ms1h = now - 3600_000;
@@ -537,12 +658,17 @@ const asInt = (v) => (typeof v === "number" && isFinite(v) ? Math.round(v) : nul
 // Persist one observability event. Captures the query, its result, phase
 // timings and OpenAI usage, plus whatever Telegram exposes about the user in
 // message.from (id/username/name/language/premium) — nothing beyond the Bot
-// API. Fire-and-forget: failures never affect the user-facing reply.
+// API.
+//
+// Durability: the row is written to a local disk spool synchronously (see
+// event-log.js), then flushed to Supabase by the background flusher. This means
+// an event survives a bot restart, crash, or transient Supabase outage — it is
+// replayed on the next startup instead of being lost. Failures never affect the
+// user-facing reply.
 async function logEvent(ev) {
   try {
-    const db = getSupabase();
     const u = ev.user || {};
-    await db.from("events").insert({
+    spoolEvent({
       interface: ev.interface,
       user_id: u.id ?? null,
       username: u.username ?? null,
@@ -563,10 +689,25 @@ async function logEvent(ev) {
       tokens: asInt(ev.tokens),
       cost: ev.cost ?? null,
       model: ev.model ?? null,
+      // client-side timestamp so we keep ordering even if flushed much later
+      created_at: new Date().toISOString(),
     });
   } catch {
     // Non-critical, ignore
   }
+}
+
+// Start the background flusher that drains the spool into Supabase (call once
+// from the long-running bot process). Also replays anything pending on startup.
+export function startEventLog(opts = {}) {
+  return startEventFlusher(getSupabase(), opts);
+}
+
+// Force-drain the spool now and report how many events remain pending. Used by
+// short-lived processes (CLI) so their events reach Supabase before exit.
+export async function flushPendingEvents() {
+  await flushEvents(getSupabase());
+  return pendingEventCount();
 }
 
 // ─── CLI Entry Point (only when run directly) ────────────────────────
@@ -592,6 +733,9 @@ if (process.argv[1] === __filename) {
         console.log(`   ${r.text.slice(0, 150)}...`);
         console.log();
       });
+
+      // Ensure this run's event reaches Supabase before the process exits.
+      await flushPendingEvents().catch(() => {});
     } catch (err) {
       console.error("[RAG] Search failed:", err.message);
       process.exit(1);

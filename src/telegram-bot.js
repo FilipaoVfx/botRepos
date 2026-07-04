@@ -6,6 +6,7 @@ import {
   searchRepos,
   getRepoDetail,
   getQueryAnalytics,
+  startEventLog,
 } from "./rag-orchestrator.js";
 import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
 import { startDashboard } from "./dashboard.js";
@@ -43,6 +44,16 @@ function idForSlug(slug) {
   idBySlug.set(slug, id);
   slugById.set(id, slug);
   return id;
+}
+
+// Trust Score badge — a compact reliability marker shown next to a repo. Only
+// rendered when the repo has engagement metrics; degrades to "" otherwise, so
+// repos without a score (or before the CSV import) render cleanly.
+function trustBadge(score) {
+  if (score == null || Number.isNaN(Number(score))) return "";
+  const s = Number(score);
+  const icon = s >= 8 ? "🟢" : s >= 6 ? "🔵" : s >= 4 ? "🟡" : s >= 2 ? "🟠" : "⚪";
+  return ` · ${icon} ${s.toFixed(1)}/10 confianza`;
 }
 
 // Escape the few characters that break Telegram legacy Markdown.
@@ -173,7 +184,8 @@ async function buildReposPage(page) {
       const url = r.repo_url || `https://github.com/${r.repo_slug}`;
       text += `*${n}.* [${escapeMd(r.repo_slug)}](${url})\n`;
       const chars = r.content_chars ? `📝 ${r.content_chars} chars` : "";
-      if (chars) text += `      ${chars}\n`;
+      const meta = `${chars}${trustBadge(r.trust_score)}`.replace(/^ · /, "");
+      if (meta) text += `      ${meta}\n`;
       detailRow.push({
         text: `🔎 ${i + 1}`,
         callback_data: `rd:${idForSlug(r.repo_slug)}`,
@@ -207,7 +219,7 @@ function buildRepoSearchText(results) {
     const score = (r.score * 100).toFixed(0);
     text +=
       `📦 *${i + 1}.* [${escapeMd(r.repo_slug)}](${r.url})\n` +
-      `      📊 ${score}% relevancia\n\n`;
+      `      📊 ${score}% relevancia${trustBadge(r.trust_score)}\n\n`;
   });
 
   return text;
@@ -223,7 +235,7 @@ function buildRepoSearchKeyboard(results) {
 
 // ─── Repos: detail (metadata + origin post) ──────────────────────────
 
-function buildRepoDetail({ repo, origins }) {
+function buildRepoDetail({ repo, origins, engagement }) {
   const url = repo.repo_url || `https://github.com/${repo.repo_slug}`;
 
   let text =
@@ -239,6 +251,16 @@ function buildRepoDetail({ repo, origins }) {
   text += `📝 README: ${repo.content_chars ?? "?"} chars${sizeKb}\n`;
   if (repo.fetched_at) {
     text += `📅 Indexado: ${new Date(repo.fetched_at).toLocaleDateString("es-ES")}\n`;
+  }
+
+  // Trust Score — solo si el repo tiene métricas de engagement.
+  if (repo.trust_score != null && engagement) {
+    text +=
+      `🛡️ *Trust Score:*${trustBadge(repo.trust_score)}\n` +
+      `      ❤️ ${Math.round(engagement.avg_likes)} likes · ` +
+      `🔖 ${Math.round(engagement.avg_saves)} saves · ` +
+      `📈 ${Number(engagement.avg_engagement_rate).toFixed(1)}% eng · ` +
+      `🔁 ${engagement.mentions_count} menciones\n`;
   }
 
   text += "\n*📌 Post(s) de origen*\n";
@@ -585,6 +607,11 @@ export async function startTelegramBot() {
 
   // Observability dashboard (continuous feedback) — no-op if PORT unset
   startDashboard();
+
+  // Durable event flusher: drains the on-disk spool into Supabase and replays
+  // anything left pending from a previous run — so restarts never lose events.
+  startEventLog();
+  console.log("[EventLog] Durable spool flusher started");
 
   // Graceful stop
   process.once("SIGINT", () => telegramBot.stop("SIGINT"));
