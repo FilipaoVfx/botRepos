@@ -3,7 +3,7 @@ dotenv.config();
 
 import { createClient } from "@supabase/supabase-js";
 import { queryVectors } from "./rag-pinecone.js";
-import { getEmbedding } from "./rag-openai.js";
+import { getEmbeddingDetailed } from "./rag-openai.js";
 
 let supabase = null;
 
@@ -21,24 +21,39 @@ function getSupabase() {
   return supabase;
 }
 
+// Embedding pricing — USD per 1K tokens. Only the query embedding hits OpenAI;
+// there is no generative LLM step in this pipeline (retrieval-only RAG).
+const EMBED_PRICE_PER_1K = {
+  "text-embedding-3-small": 0.00002,
+  "text-embedding-3-large": 0.00013,
+  "text-embedding-ada-002": 0.0001,
+};
+function embeddingCost(tokens, model) {
+  if (tokens == null) return null;
+  const price = EMBED_PRICE_PER_1K[model] ?? EMBED_PRICE_PER_1K["text-embedding-3-small"];
+  return +((tokens / 1000) * price).toFixed(8);
+}
+
 // Simple in-memory embedding cache (TTL: 5 min)
 const embedCache = new Map();
 const EMBED_CACHE_TTL = 300_000;
 const EMBED_CACHE_MAX = 100;
 
+// Returns { embedding, tokens, model, cached }. On a cache hit tokens = 0 (no
+// OpenAI call was made), so cost attribution stays accurate.
 async function getCachedEmbedding(query) {
   const key = query.toLowerCase().trim();
   const cached = embedCache.get(key);
   if (cached && Date.now() - cached.t < EMBED_CACHE_TTL) {
-    return cached.v;
+    return { embedding: cached.v, tokens: 0, model: cached.model, cached: true };
   }
-  const embedding = await getEmbedding(query);
-  embedCache.set(key, { v: embedding, t: Date.now() });
+  const { embedding, tokens, model } = await getEmbeddingDetailed(query);
+  embedCache.set(key, { v: embedding, t: Date.now(), model });
   if (embedCache.size > EMBED_CACHE_MAX) {
     const oldest = [...embedCache.entries()].sort((a, b) => a[1].t - b[1].t)[0];
     embedCache.delete(oldest[0]);
   }
-  return embedding;
+  return { embedding, tokens, model, cached: false };
 }
 
 // ─── Search ──────────────────────────────────────────────────────────
@@ -48,28 +63,56 @@ export async function ragSearch(query, options = {}) {
     topK = 5,
     sourceType = null,
     interface: iface = "api",
+    user = null,
   } = options;
 
   const startedAt = Date.now();
 
   // 1. Embed the query (with cache)
-  const queryEmbedding = await getCachedEmbedding(query);
+  const tEmbed = Date.now();
+  const emb = await getCachedEmbedding(query);
+  const embeddingTime = Date.now() - tEmbed;
 
   // 2. Query Pinecone
+  const tRetrieval = Date.now();
   const filter = sourceType ? { source_type: sourceType } : {};
-  const matches = await queryVectors(queryEmbedding, { topK, filter });
+  const matches = await queryVectors(emb.embedding, { topK, filter });
+  const retrievalTime = Date.now() - tRetrieval;
 
   // 3. Enrich with Supabase data (batch)
   const enriched = await batchEnrichResults(matches);
 
-  // 4. Log query (fire-and-forget, non-blocking)
-  logQuery(query, iface, enriched.length, Date.now() - startedAt).catch(() => {});
+  const responseTime = Date.now() - startedAt;
+
+  // 4. Log event (fire-and-forget, non-blocking)
+  logEvent({
+    interface: iface,
+    user,
+    query,
+    resultsCount: enriched.length,
+    sources: enriched.map(sourceRef),
+    responseTime,
+    embeddingTime,
+    retrievalTime,
+    tokens: emb.tokens,
+    cost: embeddingCost(emb.tokens, emb.model),
+    model: emb.model,
+  }).catch(() => {});
 
   return {
     query,
     results: enriched,
     total: enriched.length,
-    latency_ms: Date.now() - startedAt,
+    latency_ms: responseTime,
+  };
+}
+
+// Compact, stable reference for an enriched result — stored in events.sources.
+function sourceRef(r) {
+  return {
+    type: r.source_type ?? null,
+    id: r.item_id ?? null,
+    score: r.score != null ? +r.score.toFixed(4) : null,
   };
 }
 
@@ -107,15 +150,19 @@ export async function listRepos({ page = 1, pageSize = 5 } = {}) {
 
 // Semantic search restricted to repos only (source_type = readme).
 // Dedupes chunk-level matches down to unique repos, keeping the best score.
-export async function searchRepos(query, { topK = 5 } = {}) {
+export async function searchRepos(query, { topK = 5, user = null } = {}) {
   const startedAt = Date.now();
-  const queryEmbedding = await getCachedEmbedding(query);
+  const tEmbed = Date.now();
+  const emb = await getCachedEmbedding(query);
+  const embeddingTime = Date.now() - tEmbed;
 
   // Over-fetch chunks so that after de-duplication we still have enough repos.
-  const matches = await queryVectors(queryEmbedding, {
+  const tRetrieval = Date.now();
+  const matches = await queryVectors(emb.embedding, {
     topK: topK * 5,
     filter: { source_type: "readme" },
   });
+  const retrievalTime = Date.now() - tRetrieval;
 
   const bySlug = new Map();
   for (const match of matches) {
@@ -135,15 +182,27 @@ export async function searchRepos(query, { topK = 5 } = {}) {
     .sort((a, b) => b.score - a.score)
     .slice(0, topK);
 
-  logQuery(query, "telegram-repo", repos.length, Date.now() - startedAt).catch(
-    () => {}
-  );
+  const responseTime = Date.now() - startedAt;
+
+  logEvent({
+    interface: "telegram-repo",
+    user,
+    query,
+    resultsCount: repos.length,
+    sources: repos.map((r) => ({ type: "readme", id: r.repo_slug, score: r.score != null ? +r.score.toFixed(4) : null })),
+    responseTime,
+    embeddingTime,
+    retrievalTime,
+    tokens: emb.tokens,
+    cost: embeddingCost(emb.tokens, emb.model),
+    model: emb.model,
+  }).catch(() => {});
 
   return {
     query,
     results: repos,
     total: repos.length,
-    latency_ms: Date.now() - startedAt,
+    latency_ms: responseTime,
   };
 }
 
@@ -214,7 +273,7 @@ export async function getKnowledgeStats() {
   const [bookmarks, readmes, queries] = await Promise.all([
     db.from("bookmarks").select("*", { count: "exact", head: true }),
     db.from("github_repo_readmes").select("*", { count: "exact", head: true }),
-    db.from("rag_queries_log").select("*", { count: "exact", head: true }),
+    db.from("events").select("*", { count: "exact", head: true }),
   ]);
 
   return {
@@ -222,6 +281,160 @@ export async function getKnowledgeStats() {
     readmes: readmes.count ?? 0,
     queries: queries.count ?? 0,
     error: bookmarks.error?.message || readmes.error?.message || queries.error?.message || null,
+  };
+}
+
+// ─── Query Analytics (observability) ─────────────────────────────────
+
+// Percentile from an already-sorted ascending array of numbers.
+function percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+  return sorted[idx];
+}
+
+// Aggregate the events table into a dashboard-ready snapshot.
+// Pulls a bounded recent window (default 7 days, capped at 5000 rows) and
+// computes everything in-memory — the table is tiny and this keeps it to one
+// round-trip.
+export async function getQueryAnalytics({ windowDays = 7, topN = 10 } = {}) {
+  const db = getSupabase();
+  const now = Date.now();
+  const since = new Date(now - windowDays * 86400_000).toISOString();
+
+  const { data, error } = await db
+    .from("events")
+    .select(
+      "query, interface, results_count, response_time, embedding_time, retrieval_time, tokens, cost, user_id, username, created_at"
+    )
+    .gte("created_at", since)
+    .order("created_at", { ascending: false })
+    .limit(5000);
+
+  if (error) throw error;
+  const rows = data || [];
+
+  const ms24 = now - 86400_000;
+  const ms1h = now - 3600_000;
+  const t = (r) => new Date(r.created_at).getTime();
+
+  const last24 = rows.filter((r) => t(r) >= ms24);
+  const lastHour = rows.filter((r) => t(r) >= ms1h);
+
+  // Latency stats over the last 24h (fall back to full window if sparse).
+  const latSource = last24.length >= 5 ? last24 : rows;
+  const latencies = latSource
+    .map((r) => r.response_time || 0)
+    .filter((n) => n > 0)
+    .sort((a, b) => a - b);
+  const avg = latencies.length
+    ? Math.round(latencies.reduce((s, n) => s + n, 0) / latencies.length)
+    : 0;
+
+  // Phase timing averages (last 24h) + token / cost usage.
+  const avgOf = (src, k) => {
+    const v = src.map((r) => r[k] || 0).filter((n) => n > 0);
+    return v.length ? Math.round(v.reduce((s, n) => s + n, 0) / v.length) : 0;
+  };
+  const sumOf = (src, k) => src.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+
+  // Success = at least one result returned.
+  const withResults = rows.filter((r) => (r.results_count ?? 0) > 0).length;
+  const successRate = rows.length ? Math.round((withResults / rows.length) * 100) : 100;
+
+  // Zero-result queries = the content-gap signal.
+  const zero = rows.filter((r) => (r.results_count ?? 0) === 0);
+
+  // Group by interface.
+  const ifaceMap = new Map();
+  for (const r of rows) {
+    const k = r.interface || "unknown";
+    const e = ifaceMap.get(k) || { interface: k, count: 0, latSum: 0 };
+    e.count++;
+    e.latSum += r.response_time || 0;
+    ifaceMap.set(k, e);
+  }
+  const byInterface = [...ifaceMap.values()]
+    .map((e) => ({ interface: e.interface, count: e.count, avgLatency: Math.round(e.latSum / e.count) }))
+    .sort((a, b) => b.count - a.count);
+
+  // Top queries (normalized, case-insensitive).
+  const qMap = new Map();
+  for (const r of rows) {
+    const key = (r.query || "").trim().toLowerCase();
+    if (!key) continue;
+    const e = qMap.get(key) || { query: r.query.trim(), count: 0, lastAt: r.created_at };
+    e.count++;
+    if (new Date(r.created_at) > new Date(e.lastAt)) e.lastAt = r.created_at;
+    qMap.set(key, e);
+  }
+  const topQueries = [...qMap.values()].sort((a, b) => b.count - a.count).slice(0, topN);
+
+  // Top users (Telegram only — rows carrying a user_id).
+  const uMap = new Map();
+  for (const r of rows) {
+    if (r.user_id == null) continue;
+    const e = uMap.get(r.user_id) || {
+      user_id: r.user_id,
+      username: r.username || null,
+      count: 0,
+      lastAt: r.created_at,
+    };
+    e.count++;
+    if (!e.username && r.username) e.username = r.username;
+    if (new Date(r.created_at) > new Date(e.lastAt)) e.lastAt = r.created_at;
+    uMap.set(r.user_id, e);
+  }
+  const topUsers = [...uMap.values()].sort((a, b) => b.count - a.count).slice(0, topN);
+
+  // Hourly volume for the last 24h (24 buckets, oldest→newest).
+  const buckets = new Array(24).fill(0);
+  const errBuckets = new Array(24).fill(0);
+  for (const r of last24) {
+    const hoursAgo = Math.floor((now - t(r)) / 3600_000);
+    if (hoursAgo >= 0 && hoursAgo < 24) {
+      const idx = 23 - hoursAgo;
+      buckets[idx]++;
+      if ((r.results_count ?? 0) === 0) errBuckets[idx]++;
+    }
+  }
+
+  return {
+    generatedAt: new Date(now).toISOString(),
+    windowDays,
+    totals: { all: rows.length, last24h: last24.length, lastHour: lastHour.length },
+    latency: {
+      avg,
+      p50: percentile(latencies, 50),
+      p95: percentile(latencies, 95),
+      max: latencies.length ? latencies[latencies.length - 1] : 0,
+    },
+    successRate,
+    zeroResults: {
+      total: zero.length,
+      last24h: zero.filter((r) => t(r) >= ms24).length,
+      recent: zero.slice(0, topN).map((r) => ({
+        query: r.query,
+        interface: r.interface,
+        created_at: r.created_at,
+      })),
+    },
+    byInterface,
+    topQueries,
+    topUsers,
+    uniqueUsers: uMap.size,
+    phases: {
+      embeddingAvg: avgOf(latSource, "embedding_time"),
+      retrievalAvg: avgOf(latSource, "retrieval_time"),
+    },
+    usage: {
+      tokens24h: sumOf(last24, "tokens"),
+      tokensAll: sumOf(rows, "tokens"),
+      cost24h: +sumOf(last24, "cost").toFixed(6),
+      costAll: +sumOf(rows, "cost").toFixed(6),
+    },
+    hourly: buckets,
+    hourlyZero: errBuckets,
   };
 }
 
@@ -319,14 +532,37 @@ function deriveTitle(bookmark) {
 
 // ─── Query Logging ───────────────────────────────────────────────────
 
-async function logQuery(query, iface, resultsCount, latencyMs) {
+const asInt = (v) => (typeof v === "number" && isFinite(v) ? Math.round(v) : null);
+
+// Persist one observability event. Captures the query, its result, phase
+// timings and OpenAI usage, plus whatever Telegram exposes about the user in
+// message.from (id/username/name/language/premium) — nothing beyond the Bot
+// API. Fire-and-forget: failures never affect the user-facing reply.
+async function logEvent(ev) {
   try {
     const db = getSupabase();
-    await db.from("rag_queries_log").insert({
-      query,
-      interface: iface,
-      results_count: resultsCount,
-      latency_ms: latencyMs,
+    const u = ev.user || {};
+    await db.from("events").insert({
+      interface: ev.interface,
+      user_id: u.id ?? null,
+      username: u.username ?? null,
+      first_name: u.first_name ?? null,
+      last_name: u.last_name ?? null,
+      language_code: u.language_code ?? null,
+      is_premium: u.is_premium ?? null,
+      is_bot: u.is_bot ?? null,
+      chat_id: u.chat_id ?? null,
+      chat_type: u.chat_type ?? null,
+      query: ev.query,
+      results_count: ev.resultsCount ?? 0,
+      sources: ev.sources ?? null,
+      response_time: asInt(ev.responseTime),
+      embedding_time: asInt(ev.embeddingTime),
+      retrieval_time: asInt(ev.retrievalTime),
+      llm_time: null, // retrieval-only RAG: no generative step
+      tokens: asInt(ev.tokens),
+      cost: ev.cost ?? null,
+      model: ev.model ?? null,
     });
   } catch {
     // Non-critical, ignore

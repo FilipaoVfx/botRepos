@@ -5,10 +5,32 @@ import {
   listRepos,
   searchRepos,
   getRepoDetail,
+  getQueryAnalytics,
 } from "./rag-orchestrator.js";
 import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
+import { startDashboard } from "./dashboard.js";
 
 const REPOS_PAGE_SIZE = 5;
+
+// Extract the user/chat context that Telegram's Bot API exposes on a message
+// (message.from + chat). This is only what the user voluntarily sends by
+// messaging the bot — no phone number, no scraping, nothing beyond the API.
+// Passed to the RAG layer for the observability `events` log.
+function tgUser(ctx) {
+  const f = ctx?.from;
+  if (!f) return null;
+  return {
+    id: f.id ?? null,
+    username: f.username ?? null,
+    first_name: f.first_name ?? null,
+    last_name: f.last_name ?? null,
+    language_code: f.language_code ?? null,
+    is_premium: f.is_premium ?? null,
+    is_bot: f.is_bot ?? null,
+    chat_id: ctx.chat?.id ?? null,
+    chat_type: ctx.chat?.type ?? null,
+  };
+}
 
 // Map short ids <-> repo slugs so inline-button callback_data stays well under
 // Telegram's 64-byte limit even for long owner/repo slugs.
@@ -40,6 +62,7 @@ const BOT_COMMANDS = [
   { command: "buscar_repo", description: "Búsqueda semántica solo de repos" },
   { command: "status", description: "Estado del bot y del hosting" },
   { command: "data", description: "Estadísticas de la base de conocimiento" },
+  { command: "insights", description: "Analítica de uso y brechas de contenido" },
   { command: "help", description: "Mostrar ayuda" },
 ];
 
@@ -255,6 +278,7 @@ export async function startTelegramBot() {
         "/buscar_repo <query> — Búsqueda semántica solo de repos\n" +
         "/status — Estado del bot y del hosting\n" +
         "/data — Estadísticas de la base de conocimiento\n" +
+        "/insights — Analítica de uso y brechas de contenido\n" +
         "/help — Mostrar ayuda\n\n" +
         "*Ejemplos:*\n" +
         "→ react hooks patterns\n" +
@@ -275,7 +299,8 @@ export async function startTelegramBot() {
         "/repos — Listar todos los repositorios (paginado)\n" +
         "/buscar_repo <query> — Búsqueda semántica solo de repos\n" +
         "/status — Estado del bot y del hosting\n" +
-        "/data — Estadísticas de la base de conocimiento\n\n" +
+        "/data — Estadísticas de la base de conocimiento\n" +
+        "/insights — Analítica de uso y brechas de contenido\n\n" +
         "*En grupos:*\n" +
         "Menciona al bot: @tu_bot \"query\"\n" +
         "O responde a un mensaje del bot\n\n" +
@@ -298,7 +323,7 @@ export async function startTelegramBot() {
     await ctx.replyWithChatAction("typing");
 
     try {
-      const results = await ragSearch(query, { topK: 3, interface: "telegram" });
+      const results = await ragSearch(query, { topK: 3, interface: "telegram", user: tgUser(ctx) });
       ctx.reply(formatTelegramResults(results), { parse_mode: "Markdown" });
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
@@ -318,7 +343,7 @@ export async function startTelegramBot() {
     await ctx.replyWithChatAction("typing");
 
     try {
-      const results = await ragSearch(query, { topK: 5, sourceType, interface: "telegram" });
+      const results = await ragSearch(query, { topK: 5, sourceType, interface: "telegram", user: tgUser(ctx) });
       ctx.reply(formatTelegramResults(results), { parse_mode: "Markdown" });
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
@@ -369,7 +394,7 @@ export async function startTelegramBot() {
     await ctx.replyWithChatAction("typing");
 
     try {
-      const results = await searchRepos(query, { topK: 5 });
+      const results = await searchRepos(query, { topK: 5, user: tgUser(ctx) });
       ctx.reply(buildRepoSearchText(results), {
         parse_mode: "Markdown",
         reply_markup: buildRepoSearchKeyboard(results),
@@ -482,6 +507,51 @@ export async function startTelegramBot() {
     }
   });
 
+  // /insights — usage analytics + content-gap signal (continuous feedback)
+  telegramBot.command("insights", async (ctx) => {
+    await ctx.replyWithChatAction("typing");
+
+    try {
+      const a = await getQueryAnalytics({ windowDays: 7, topN: 5 });
+      const t = a.totals;
+      const l = a.latency;
+      const z = a.zeroResults;
+
+      let msg =
+        "📈 *Insights de uso* — últimos 7 días\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `🔍 Consultas: *${t.all}* (24h: ${t.last24h} · 1h: ${t.lastHour})\n` +
+        `✅ Tasa de éxito: *${a.successRate}%*\n` +
+        `⚡ Latencia: media ${l.avg}ms · p95 ${l.p95}ms\n\n`;
+
+      msg += "*🧩 Por interfaz*\n";
+      msg += a.byInterface.length
+        ? a.byInterface
+            .map((x) => `   • ${escapeMd(x.interface)}: ${x.count} (${x.avgLatency}ms)`)
+            .join("\n") + "\n\n"
+        : "   _sin datos_\n\n";
+
+      msg += "*🔥 Top consultas*\n";
+      msg += a.topQueries.length
+        ? a.topQueries
+            .map((x, i) => `   ${i + 1}. ${escapeMd(x.query)} ×${x.count}`)
+            .join("\n") + "\n\n"
+        : "   _sin datos_\n\n";
+
+      msg += `*⚠️ Sin resultados* — brechas de contenido (${z.total})\n`;
+      msg += z.recent.length
+        ? z.recent.map((x) => `   • ${escapeMd(x.query)}`).join("\n")
+        : "   _ninguna — todo consulta devolvió resultados 👌_";
+
+      const port = process.env.PORT || process.env.DASHBOARD_PORT;
+      if (port) msg += `\n\n📊 _Dashboard en vivo: puerto ${port}_`;
+
+      ctx.reply(msg, { parse_mode: "Markdown" });
+    } catch (err) {
+      ctx.reply(`❌ Error: ${err.message}`);
+    }
+  });
+
   // Handle plain text as search (works in DMs and groups)
   telegramBot.on("text", async (ctx) => {
     const text = ctx.message.text;
@@ -502,7 +572,7 @@ export async function startTelegramBot() {
     await ctx.replyWithChatAction("typing");
 
     try {
-      const results = await ragSearch(cleanText, { topK: 5, interface: "telegram" });
+      const results = await ragSearch(cleanText, { topK: 5, interface: "telegram", user: tgUser(ctx) });
       ctx.reply(formatTelegramResults(results), { parse_mode: "Markdown" });
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
@@ -512,6 +582,9 @@ export async function startTelegramBot() {
   // Launch
   telegramBot.launch();
   console.log("[Telegram] Bot started");
+
+  // Observability dashboard (continuous feedback) — no-op if PORT unset
+  startDashboard();
 
   // Graceful stop
   process.once("SIGINT", () => telegramBot.stop("SIGINT"));

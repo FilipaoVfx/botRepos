@@ -30,6 +30,24 @@ export async function getEmbedding(text, model = DEFAULT_MODEL) {
   return response.data[0].embedding;
 }
 
+// Like getEmbedding, but also surfaces OpenAI token usage + the model used, so
+// callers (e.g. the observability pipeline) can attribute tokens and cost.
+export async function getEmbeddingDetailed(text, model = DEFAULT_MODEL) {
+  const client = await getOpenAIClient();
+  const modelId = model || process.env.OPENAI_EMBEDDING_MODEL || DEFAULT_MODEL;
+
+  const response = await client.embeddings.create({
+    model: modelId,
+    input: text,
+  });
+
+  return {
+    embedding: response.data[0].embedding,
+    tokens: response.usage?.total_tokens ?? null,
+    model: modelId,
+  };
+}
+
 export async function getEmbeddings(texts, model = DEFAULT_MODEL) {
   const client = await getOpenAIClient();
   const modelId = model || process.env.OPENAI_EMBEDDING_MODEL || DEFAULT_MODEL;
