@@ -323,10 +323,16 @@ async function findRepoOrigins(slug, repoUrl) {
 // un único sitio — la usan el importador de CSV y cualquier recálculo en vivo —
 // y está versionada para poder recomputar sin ambigüedad. Escala 0.00–10.00.
 // Detalle y pesos: trust_score.md.
-export const TRUST_SCORE_VERSION = 2;
+export const TRUST_SCORE_VERSION = 3;
 
-// v2: métricas reales del post PADRE (scraper.tech). engagement_rate se computa
-// aquí como interacciones/views (fracción real), no el % roto del CSV viejo.
+// v3: recalibrado para que posts orgánicos de repos usen TODO el rango 0–10.
+// v2 clavaba todo en 2–6 porque sus divisores lineales (1000 likes / 500k views
+// / 10% engagement / 10 menciones) sólo los llenaba un tweet viral, dejando 3 de
+// 5 cubos casi vacíos siempre. v3 cambia:
+//   - escala logarítmica en volumen (likes/saves/views): reparte bien entre
+//     repos chicos y grandes sin que un post enorme aplaste al resto.
+//   - engagement rate con tope realista (6%, no 10%).
+//   - "menciones" baja de 15% → 10% (casi siempre es 1: era peso muerto).
 // Acepta tanto el objeto raw en vivo (likes, retweets, ...) como una fila
 // almacenada (avg_likes, avg_saves, ...) para poder recomputar sin re-fetch.
 export function computeTrustScore(m = {}) {
@@ -343,13 +349,23 @@ export function computeTrustScore(m = {}) {
     m.avg_interactions != null ? n(m.avg_interactions) : likes + retweets + replies + quotes + bookmarks;
   const ratePct = views > 0 ? (inter / views) * 100 : 0; // % real de interacción
 
+  // Volumen: log-normalizado a un "buen post orgánico" (0..1, tope en el ancla).
+  const logN = (x, anchor) =>
+    Math.min(Math.log10(1 + Math.max(x, 0)) / Math.log10(1 + anchor), 1);
+  const likesN = logN(likes, 1000); // 1k likes ≈ tope
+  const savesN = logN(bookmarks, 800); // 800 saves ≈ tope
+  const viewsN = logN(views, 300000); // 300k impresiones ≈ tope
+  const rateN = Math.min(ratePct / 6, 1); // 6% de interacción ≈ tope
+  const mentN = Math.min(mentions / 3, 1); // 3+ posts ≈ tope
+
   let score =
-    Math.min(likes / 100, 10) * 0.25 + // aprobación
-    Math.min(bookmarks / 50, 10) * 0.2 + // saves = intención de volver
-    Math.min(ratePct, 10) * 0.25 + // engagement rate real (10%+ = tope)
-    Math.min(mentions, 10) * 0.15 + // reincidencia
-    Math.min(views / 50000, 10) * 0.15; // alcance
-  score *= verified ? 1 : 0.95; // leve penalización no-verificado
+    10 *
+    (0.3 * likesN + // aprobación
+      0.22 * savesN + // saves = intención de volver
+      0.25 * rateN + // calidad de la interacción
+      0.13 * viewsN + // alcance
+      0.1 * mentN); // reincidencia
+  score *= verified ? 1 : 0.97; // leve penalización no-verificado
 
   return Math.round(score * 100) / 100; // 0.00 – 10.00
 }

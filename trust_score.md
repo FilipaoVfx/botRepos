@@ -10,29 +10,43 @@ El Trust Score es un sistema de puntuación que mide la **calidad y confiabilida
 
 La premisa es simple: un repo compartido en Twitter que genera muchas interacciones (likes, saves, replies, reposts) es un repo que **resuena** con su comunidad. Cuanto más interactúa la gente, más confianza merece.
 
-### Señales actuales (CSV de Twitter Analytics)
+### Señales (v3 — métricas EN VIVO del post padre vía scraper.tech)
 
-| Señal | Peso actual | Por qué |
-|---|---|---|
-| `avg_likes` (normalizado a /50) | 25% | Aprobación directa de la audiencia |
-| `avg_saves` (normalizado a /10) | 20% | Intención de volver — más valioso que un like |
-| `engagement_rate` (×10, cap 10) | 25% | Qué % de quienes vieron el tweet interactuaron. Mide **conexión real** |
-| `total_mentions` (cap 10) | 15% | Consistencia — si el repo se menciona múltiples veces, hay reincidencia |
-| `avg_impressions` (normalizado a /5000) | 15% | Alcance bruto como señal de distribución |
+v3 recalibra v2: v2 usaba divisores lineales con techos de tweet viral (1000
+likes / 500k views / 10% engagement / 10 menciones), así que 3 de 5 cubos
+quedaban casi vacíos siempre y todo se apelmazaba en 2–6. v3 usa escala
+**logarítmica** en volumen y anclas realistas.
 
-### Fórmula
+| Señal | Peso | Normalización | Por qué |
+|---|---|---|---|
+| `avg_likes` | 30% | `log10(1+x)/log10(1+1000)` | Aprobación directa (1k likes ≈ tope) |
+| `avg_saves` | 22% | `log10(1+x)/log10(1+800)` | Intención de volver — más valioso que un like |
+| `engagement_rate` | 25% | `min(rate/6, 1)` | % real de interacción (6% ≈ tope realista). Mide **conexión** |
+| `avg_impressions` | 13% | `log10(1+x)/log10(1+300000)` | Alcance bruto como señal de distribución |
+| `mentions_count` | 10% | `min(mentions/3, 1)` | Reincidencia — repo posteado en varios tweets |
+
+`engagement_rate = interacciones / impresiones × 100` (fracción real; v2 arregló
+el % saturado del CSV). Autor no verificado: ×0.97.
+
+### Fórmula (v3)
 
 ```
-trust_score = (
-  min(likes_avg / 50, 10) × 0.25 +
-  min(saves_avg / 10, 10) × 0.20 +
-  min(mentions_count, 10) × 0.15 +
-  min(engagement_rate × 10, 10) × 0.25 +
-  min(impressions_avg / 5000, 10) × 0.15
-) / 10 × 10  → escala 0-10
+logN(x, a) = min( log10(1+x) / log10(1+a), 1 )
+
+trust_score = 10 × (
+  0.30 × logN(likes,    1000) +
+  0.22 × logN(saves,     800) +
+  0.25 × min(engagement_rate / 6, 1) +
+  0.13 × logN(impressions, 300000) +
+  0.10 × min(mentions / 3, 1)
+) × (verified ? 1 : 0.97)   → escala 0.00–10.00
 ```
 
-### Interpretación
+La fórmula vive en un único sitio: `computeTrustScore()` en `rag-orchestrator.js`
+(la usan el import de CSV y el refresco en vivo). `TRUST_SCORE_VERSION` la versiona;
+al subirla, las filas viejas se marcan stale y se recomputan al abrir el detail.
+
+### Interpretación (v3)
 
 | Rango | Significado |
 |---|---|
