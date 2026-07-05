@@ -55,7 +55,7 @@ function trustBadge(score) {
   if (score == null || Number.isNaN(Number(score))) return "";
   const s = Number(score);
   const icon = s >= 8 ? "🟢" : s >= 6 ? "🔵" : s >= 4 ? "🟡" : s >= 2 ? "🟠" : "⚪";
-  return ` · ${icon} ${s.toFixed(1)}/10 confianza`;
+  return ` · ${icon} ${s.toFixed(1)}/10`;
 }
 
 // Escape the few characters that break Telegram legacy Markdown.
@@ -258,7 +258,7 @@ function buildRepoDetail({ repo, origins, engagement }) {
   // Trust Score — solo si el repo tiene métricas de engagement.
   if (repo.trust_score != null && engagement) {
     text +=
-      `🛡️ *Trust Score:*${trustBadge(repo.trust_score)}\n` +
+      `📊 *Impacto:*${trustBadge(repo.trust_score)}\n` +
       `      ❤️ ${Math.round(engagement.avg_likes)} likes · ` +
       `🔖 ${Math.round(engagement.avg_saves)} saves · ` +
       `📈 ${Number(engagement.avg_engagement_rate).toFixed(1)}% eng · ` +
