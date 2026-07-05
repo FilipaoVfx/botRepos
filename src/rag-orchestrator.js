@@ -129,27 +129,33 @@ function sourceRef(r) {
 export async function listRepos({ page = 1, pageSize = 5 } = {}) {
   const db = getSupabase();
   const safePage = Math.max(1, page);
-  const from = (safePage - 1) * pageSize;
-  const to = from + pageSize - 1;
 
-  const { data, count, error } = await db
+  // El dataset es chico (~350 repos), así que traemos todo y rankeamos por
+  // Trust Score en memoria: los repos con score salen primero sin importar
+  // cuándo se bajó su README. Antes ordenábamos por fetched_at, lo que dejaba
+  // en la primera página los repos recién sembrados que aún no tienen métricas.
+  const { data, error } = await db
     .from("github_repo_readmes")
-    .select("repo_slug, owner, repo, repo_url, content_chars, fetched_at", {
-      count: "exact",
-    })
-    .eq("status", "ok")
-    .order("fetched_at", { ascending: false })
-    .range(from, to);
+    .select("repo_slug, owner, repo, repo_url, content_chars, fetched_at")
+    .eq("status", "ok");
 
   if (error) throw error;
 
-  const total = count ?? 0;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-
   const repos = await attachTrustScores(data || [], (r) => r.repo_slug);
+  repos.sort((a, b) => {
+    const ta = a.trust_score == null ? -Infinity : a.trust_score;
+    const tb = b.trust_score == null ? -Infinity : b.trust_score;
+    if (tb !== ta) return tb - ta; // mayor trust primero (sin score al final)
+    return new Date(b.fetched_at || 0) - new Date(a.fetched_at || 0); // desempate: recencia
+  });
+
+  const total = repos.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const from = (safePage - 1) * pageSize;
+  const pageRepos = repos.slice(from, from + pageSize);
 
   return {
-    repos,
+    repos: pageRepos,
     total,
     page: safePage,
     pageSize,
