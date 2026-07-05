@@ -259,14 +259,15 @@ export async function getRepoDetail(slug) {
   return { repo, origins, engagement };
 }
 
-// Find the bookmark(s) (origin posts) whose links reference this repo.
+// Find the bookmark(s) (origin posts) that referenced this repo.
+// Resolución en capas, de la más autoritativa a la más laxa:
+//   1) bookmark_github_repos: el link (padre, repo) que dejó el reconciliador.
+//      Resuelve los casos que el matching por URL NO ve — repos posteados como
+//      reply "link pelado" o vía t.co — que son ~1/3 de los repos linkeados.
+//   2) links / first_comment_links: la URL de GitHub literal en los arrays.
+//   3) fallback: la URL mencionada inline en el texto del tweet.
 async function findRepoOrigins(slug, repoUrl) {
   const db = getSupabase();
-
-  const base = `https://github.com/${slug}`;
-  const variants = [
-    ...new Set([base, `${base}/`, repoUrl, repoUrl && `${repoUrl}/`].filter(Boolean)),
-  ];
 
   const seen = new Map();
   const addRows = (rows) => {
@@ -275,7 +276,23 @@ async function findRepoOrigins(slug, repoUrl) {
 
   const cols = "id, source_url, author_username, author_name, text_content, created_at";
 
-  // Match on the links array and the first-comment links array.
+  // 1) Autoritativo: el link table. slug case-insensitive por si el readme
+  //    difiere en mayúsculas del link (que se guarda en minúsculas).
+  const { data: linkRows } = await db
+    .from("bookmark_github_repos")
+    .select("bookmark_id")
+    .ilike("repo_slug", slug);
+  const ids = [...new Set((linkRows || []).map((r) => r.bookmark_id).filter(Boolean))];
+  if (ids.length) {
+    const { data } = await db.from("bookmarks").select(cols).in("id", ids);
+    addRows(data);
+  }
+
+  // 2) Complemento: la URL de GitHub literal en los arrays de links.
+  const base = `https://github.com/${slug}`;
+  const variants = [
+    ...new Set([base, `${base}/`, repoUrl, repoUrl && `${repoUrl}/`].filter(Boolean)),
+  ];
   for (const field of ["links", "first_comment_links"]) {
     const { data } = await db
       .from("bookmarks")
@@ -285,7 +302,7 @@ async function findRepoOrigins(slug, repoUrl) {
     addRows(data);
   }
 
-  // Fallback: the repo URL mentioned inline in the tweet text.
+  // 3) Fallback: la URL mencionada inline en el texto del tweet.
   if (seen.size === 0) {
     const { data } = await db
       .from("bookmarks")
