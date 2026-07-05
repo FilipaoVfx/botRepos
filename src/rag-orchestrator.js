@@ -5,6 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import { queryVectors } from "./rag-pinecone.js";
 import { getEmbeddingDetailed } from "./rag-openai.js";
 import { fetchTweetMetrics, tweetIdFromUrl } from "./x-metrics.js";
+import { fetchRepoStars } from "./github-stars.js";
 import {
   spoolEvent,
   flushEvents,
@@ -244,7 +245,7 @@ export async function getRepoDetail(slug) {
   const { data: repo, error } = await db
     .from("github_repo_readmes")
     .select(
-      "repo_slug, owner, repo, repo_url, readme_html_url, content_chars, size_bytes, status, fetched_at, created_at"
+      "repo_slug, owner, repo, repo_url, readme_html_url, content_chars, size_bytes, status, fetched_at, created_at, stars, stars_updated_at"
     )
     .eq("repo_slug", slug)
     .single();
@@ -257,6 +258,32 @@ export async function getRepoDetail(slug) {
   ]);
   repo.trust_score = engagement ? Number(engagement.trust_score) : null;
   return { repo, origins, engagement };
+}
+
+// TTL de las stars: pasado esto, el bot dispara un refresh en segundo plano.
+export const STARS_TTL_MS = Number(process.env.STARS_TTL_MS) || 12 * 60 * 60 * 1000;
+
+// Refresca las stars de UN repo con el valor REAL de GitHub y lo persiste en
+// github_repo_readmes. Fire-and-forget desde el bot: el render ya mostró el
+// valor cacheado, esto sólo lo actualiza para la próxima apertura.
+export async function refreshRepoStars(slug) {
+  const db = getSupabase();
+  const { data: repo } = await db
+    .from("github_repo_readmes")
+    .select("owner, repo")
+    .eq("repo_slug", slug)
+    .single();
+  if (!repo) return null;
+
+  const stars = await fetchRepoStars(repo.owner, repo.repo);
+  if (stars == null) return null; // fallo/rate-limit: no pisar el valor guardado
+
+  const { error } = await db
+    .from("github_repo_readmes")
+    .update({ stars, stars_updated_at: new Date().toISOString() })
+    .eq("repo_slug", slug);
+  if (error) return null;
+  return stars;
 }
 
 // Find the bookmark(s) (origin posts) that referenced this repo.

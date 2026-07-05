@@ -9,6 +9,8 @@ import {
   startEventLog,
   refreshRepoTrust,
   TRUST_SCORE_VERSION,
+  refreshRepoStars,
+  STARS_TTL_MS,
 } from "./rag-orchestrator.js";
 import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
 import { startDashboard } from "./dashboard.js";
@@ -247,6 +249,8 @@ function buildRepoDetail({ repo, origins, engagement }) {
     `📂 Repo: ${escapeMd(repo.repo || "—")}\n` +
     `🔗 [Ver en GitHub](${url})\n`;
 
+  if (repo.stars != null) text += `⭐ ${Number(repo.stars).toLocaleString("es-ES")} stars\n`;
+
   if (repo.readme_html_url) text += `📄 [README](${repo.readme_html_url})\n`;
 
   const sizeKb = repo.size_bytes ? ` · ${(repo.size_bytes / 1024).toFixed(1)} KB` : "";
@@ -456,6 +460,15 @@ export async function startTelegramBot() {
         Number(eng.trust_score_version) < TRUST_SCORE_VERSION ||
         (eng.updated_at && Date.now() - new Date(eng.updated_at).getTime() > TTL_MS);
       if (stale) refreshRepoTrust(slug).catch(() => {});
+
+      // Stars reales de GitHub: mismo patrón. El render ya mostró el valor
+      // persistido; refrescamos en segundo plano si falta o pasó el TTL.
+      const rd = detail.repo;
+      const starsStale =
+        rd.stars == null ||
+        !rd.stars_updated_at ||
+        Date.now() - new Date(rd.stars_updated_at).getTime() > STARS_TTL_MS;
+      if (starsStale) refreshRepoStars(slug).catch(() => {});
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
     }
