@@ -7,6 +7,8 @@ import {
   getRepoDetail,
   getQueryAnalytics,
   startEventLog,
+  refreshRepoTrust,
+  TRUST_SCORE_VERSION,
 } from "./rag-orchestrator.js";
 import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
 import { startDashboard } from "./dashboard.js";
@@ -444,6 +446,16 @@ export async function startTelegramBot() {
         parse_mode: "Markdown",
         disable_web_page_preview: true,
       });
+
+      // Trust dinámico: refresca en segundo plano si falta / está viejo / versión
+      // de fórmula anterior. No bloquea la respuesta; se ve fresco al reabrir.
+      const eng = detail.engagement;
+      const TTL_MS = Number(process.env.TRUST_TTL_MS) || 6 * 60 * 60 * 1000;
+      const stale =
+        !eng ||
+        Number(eng.trust_score_version) < TRUST_SCORE_VERSION ||
+        (eng.updated_at && Date.now() - new Date(eng.updated_at).getTime() > TTL_MS);
+      if (stale) refreshRepoTrust(slug).catch(() => {});
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
     }

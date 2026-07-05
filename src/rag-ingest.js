@@ -80,7 +80,7 @@ async function deleteSyncState(sourceType, sourceId) {
 
 async function fetchBookmarks(options = {}) {
   const db = getSupabase();
-  const { limit = 100, offset = 0, since = null } = options;
+  const { limit = 100, offset = 0, since = null, userId = null } = options;
 
   let query = db
     .from("bookmarks")
@@ -89,6 +89,10 @@ async function fetchBookmarks(options = {}) {
     )
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
+
+  if (userId) {
+    query = query.eq("user_id", userId);
+  }
 
   if (since) {
     query = query.gte("updated_at", since);
@@ -100,11 +104,13 @@ async function fetchBookmarks(options = {}) {
 }
 
 export async function ingestBookmarks(options = {}) {
-  const { limit = 100, offset = 0, since = null, verbose = false } = options;
+  const { limit = 100, offset = 0, since = null, userId = null, verbose = false } = options;
 
-  console.log(`[RAG] Starting bookmark ingestion (limit=${limit}, offset=${offset})`);
+  console.log(
+    `[RAG] Starting bookmark ingestion (limit=${limit}, offset=${offset}${userId ? `, user=${userId}` : ""})`
+  );
 
-  const bookmarks = await fetchBookmarks({ limit, offset, since });
+  const bookmarks = await fetchBookmarks({ limit, offset, since, userId });
   console.log(`[RAG] Fetched ${bookmarks.length} bookmarks`);
 
   let ingested = 0;
@@ -316,15 +322,21 @@ export async function ingestAll(options = {}) {
 const args = process.argv.slice(2);
 const command = args[0] || "all";
 
+// Filtro opcional por usuario: --user=<id> o env INGEST_USER_ID.
+// Con esto ingestas SOLO los bookmarks de ese usuario (p. ej. x-csv-import),
+// sin tocar los de otros usuarios.
+const userArg = args.find((a) => a.startsWith("--user="));
+const userId = userArg ? userArg.slice("--user=".length) : (process.env.INGEST_USER_ID || null);
+
 try {
   if (command === "bookmarks") {
-    await ingestBookmarks({ limit: 2000, verbose: true });
+    await ingestBookmarks({ limit: 2000, verbose: true, userId });
   } else if (command === "readmes") {
     await ingestReadmes({ limit: 500, verbose: true });
   } else if (command === "all") {
     await ingestAll({ verbose: true });
   } else {
-    console.log("Usage: node rag-ingest.js [bookmarks|readmes|all]");
+    console.log("Usage: node rag-ingest.js [bookmarks|readmes|all] [--user=<id>]");
     process.exit(1);
   }
 } catch (err) {

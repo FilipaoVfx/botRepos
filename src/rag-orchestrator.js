@@ -4,6 +4,7 @@ dotenv.config();
 import { createClient } from "@supabase/supabase-js";
 import { queryVectors } from "./rag-pinecone.js";
 import { getEmbeddingDetailed } from "./rag-openai.js";
+import { fetchTweetMetrics, tweetIdFromUrl } from "./x-metrics.js";
 import {
   spoolEvent,
   flushEvents,
@@ -186,11 +187,25 @@ export async function searchRepos(query, { topK = 5, user = null } = {}) {
     }
   }
 
-  const repos = [...bySlug.values()]
+  // Rerank: amplía candidatos, adjunta trust, mezcla score vectorial + trust,
+  // y CORTA al final. Boost multiplicativo: el vector manda, trust empuja.
+  //   final = score * (1 + BOOST * trust/10)   (trust null → sin empuje)
+  const candidates = [...bySlug.values()]
     .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
+    .slice(0, Math.max(topK * 3, topK));
 
-  await attachTrustScores(repos, (r) => r.repo_slug);
+  await attachTrustScores(candidates, (r) => r.repo_slug);
+
+  const BOOST = Number(process.env.TRUST_BOOST) || 0.3;
+  for (const r of candidates) {
+    const t = Number.isFinite(r.trust_score) ? r.trust_score : 0;
+    r.vector_score = r.score;
+    r.final_score = r.score * (1 + BOOST * (t / 10));
+  }
+
+  const repos = candidates
+    .sort((a, b) => b.final_score - a.final_score)
+    .slice(0, topK);
 
   const responseTime = Date.now() - startedAt;
 
@@ -285,16 +300,106 @@ async function findRepoOrigins(slug, repoUrl) {
 // un único sitio — la usan el importador de CSV y cualquier recálculo en vivo —
 // y está versionada para poder recomputar sin ambigüedad. Escala 0.00–10.00.
 // Detalle y pesos: trust_score.md.
-export const TRUST_SCORE_VERSION = 1;
+export const TRUST_SCORE_VERSION = 2;
 
+// v2: métricas reales del post PADRE (scraper.tech). engagement_rate se computa
+// aquí como interacciones/views (fracción real), no el % roto del CSV viejo.
+// Acepta tanto el objeto raw en vivo (likes, retweets, ...) como una fila
+// almacenada (avg_likes, avg_saves, ...) para poder recomputar sin re-fetch.
 export function computeTrustScore(m = {}) {
-  const score =
-    Math.min((Number(m.avg_likes) || 0) / 50, 10) * 0.25 +
-    Math.min((Number(m.avg_saves) || 0) / 10, 10) * 0.2 +
-    Math.min(Number(m.mentions_count) || 0, 10) * 0.15 +
-    Math.min((Number(m.avg_engagement_rate) || 0) * 10, 10) * 0.25 +
-    Math.min((Number(m.avg_impressions) || 0) / 5000, 10) * 0.15;
+  const n = (x) => (Number.isFinite(Number(x)) ? Number(x) : 0);
+  const likes = n(m.likes ?? m.avg_likes);
+  const bookmarks = n(m.bookmarks ?? m.avg_saves);
+  const views = n(m.views ?? m.avg_impressions);
+  const retweets = n(m.retweets ?? m.avg_reposts);
+  const replies = n(m.replies ?? m.avg_replies);
+  const quotes = n(m.quotes);
+  const mentions = n(m.mentions_count);
+  const verified = Boolean(m.verified);
+  const inter =
+    m.avg_interactions != null ? n(m.avg_interactions) : likes + retweets + replies + quotes + bookmarks;
+  const ratePct = views > 0 ? (inter / views) * 100 : 0; // % real de interacción
+
+  let score =
+    Math.min(likes / 100, 10) * 0.25 + // aprobación
+    Math.min(bookmarks / 50, 10) * 0.2 + // saves = intención de volver
+    Math.min(ratePct, 10) * 0.25 + // engagement rate real (10%+ = tope)
+    Math.min(mentions, 10) * 0.15 + // reincidencia
+    Math.min(views / 50000, 10) * 0.15; // alcance
+  score *= verified ? 1 : 0.95; // leve penalización no-verificado
+
   return Math.round(score * 100) / 100; // 0.00 – 10.00
+}
+
+// Refresca el trust de UN repo con métricas EN VIVO del/los post(s) padre.
+// - Resuelve los posts padre (findRepoOrigins) → tweetId.
+// - fetchTweetMetrics de cada uno; agrega quedándose con el de mayor resonancia
+//   (likes + bookmarks) como representante del repo. mentions_count = nº de padres.
+// - Upsert en repo_engagement_metrics. Diseñado para fire-and-forget desde el bot.
+// Devuelve la fila escrita, o null si no hay padre / no se pudo fetchear.
+export async function refreshRepoTrust(slug) {
+  const db = getSupabase();
+
+  // Padres autoritativos: bookmark_github_repos (slug lowercase exacto), evita
+  // los fallos por mayúsculas / t.co de la derivación por texto.
+  const { data: linkRows } = await db
+    .from("bookmark_github_repos")
+    .select("bookmark_id")
+    .eq("repo_slug", slug);
+  const ids = [...new Set((linkRows || []).map((r) => String(r.bookmark_id)).filter(Boolean))];
+  if (!ids.length) return null;
+
+  const { data: origins } = await db
+    .from("bookmarks")
+    .select("id, source_url")
+    .in("id", ids);
+  if (!origins || !origins.length) return null;
+
+  let best = null;
+  let bestResonance = -1;
+  for (const o of origins) {
+    const tweetId = tweetIdFromUrl(o.source_url) || String(o.id || "");
+    const m = await fetchTweetMetrics(tweetId);
+    if (!m) continue;
+    const resonance = m.likes + m.bookmarks;
+    if (resonance > bestResonance) {
+      bestResonance = resonance;
+      best = { m, origin: o };
+    }
+  }
+  if (!best) return null;
+
+  const { m, origin } = best;
+  const mentions = origins.length;
+  const inter = m.likes + m.retweets + m.replies + m.quotes + m.bookmarks;
+  const ratePct = m.views > 0 ? (inter / m.views) * 100 : 0;
+  const round2 = (x) => Math.round(x * 100) / 100;
+
+  const row = {
+    repo_slug: slug,
+    source_url: origin.source_url || `https://github.com/${slug}`,
+    mentions_count: mentions,
+    avg_likes: m.likes,
+    avg_impressions: m.views,
+    avg_interactions: inter,
+    avg_saves: m.bookmarks,
+    avg_shares: 0,
+    avg_replies: m.replies,
+    avg_reposts: m.retweets,
+    avg_profile_visits: 0,
+    avg_url_clicks: 0,
+    avg_engagement_rate: round2(ratePct),
+    avg_like_rate: m.views > 0 ? round2((m.likes / m.views) * 100) : 0,
+    trust_score: computeTrustScore({ ...m, mentions_count: mentions }),
+    trust_score_version: TRUST_SCORE_VERSION,
+    updated_at: new Date().toISOString(),
+  };
+
+  const { error } = await db
+    .from("repo_engagement_metrics")
+    .upsert(row, { onConflict: "repo_slug" });
+  if (error) return null;
+  return row;
 }
 
 // Batch-fetch engagement metrics for a set of repo slugs → Map(slug → row).
