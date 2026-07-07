@@ -61,4 +61,4 @@ Ver `.env.example`. Resumen:
 | `OPENAI_EMBEDDING_MODEL` | — | `text-embedding-3-small` |
 | `TELEGRAM_BOT_TOKEN` | ✅ (para el bot) | — |
 
-> ⚠️ **Nunca** subas `.env` al repo. Ya está en `.gitignore`.
+
