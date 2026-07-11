@@ -1,0 +1,43 @@
+name: RAG auto-ingest
+
+# Indexa en Pinecone lo nuevo cada 6h:
+#  1) baja READMEs pendientes (github_repo_readmes: pending/error -> ok)
+#  2) rag-ingest all: embeddings de bookmarks + readmes nuevos (dedup por
+#     content_hash en rag_sync_state; lo ya indexado se salta, costo ~0)
+# Disparo manual: pestaña Actions -> RAG auto-ingest -> Run workflow.
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: rag-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX: ${{ secrets.PINECONE_INDEX }}
+      GITHUB_README_TOKEN: ${{ secrets.README_FETCH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Fetch pending READMEs
+        run: node scripts/fetch-pending-readmes.js --limit=100
+
+      - name: Ingest bookmarks + readmes into Pinecone
+        run: node src/rag-ingest.js all
