@@ -39,32 +39,65 @@ const BATCH_SIZE = 10;
 
 // ─── Sync State Management ────────────────────────────────────────────
 
-async function getSyncState(sourceType, sourceId, chunkIndex) {
-  const db = getSupabase();
-  const { data } = await db
-    .from("rag_sync_state")
-    .select("pinecone_id, content_hash")
-    .eq("source_type", sourceType)
-    .eq("source_id", sourceId)
-    .eq("chunk_index", chunkIndex)
-    .single();
+// Cache del sync-state completo por source_type: 2-3 queries paginadas en vez
+// de una por chunk (miles de round-trips seriales mataban el cron de Actions).
+const syncStateCache = new Map(); // sourceType -> Map("id:chunk" -> {content_hash})
 
-  return data;
+async function loadSyncStateMap(sourceType) {
+  if (syncStateCache.has(sourceType)) return syncStateCache.get(sourceType);
+  const db = getSupabase();
+  const map = new Map();
+  const pageSize = 1000;
+  let from = 0;
+  for (;;) {
+    const { data, error } = await db
+      .from("rag_sync_state")
+      .select("source_id, chunk_index, content_hash")
+      .eq("source_type", sourceType)
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    const rows = data || [];
+    for (const r of rows) map.set(`${r.source_id}:${r.chunk_index}`, { content_hash: r.content_hash });
+    if (rows.length < pageSize) break;
+    from += pageSize;
+  }
+  syncStateCache.set(sourceType, map);
+  return map;
+}
+
+async function getSyncState(sourceType, sourceId, chunkIndex) {
+  const map = await loadSyncStateMap(sourceType);
+  return map.get(`${sourceId}:${chunkIndex}`) || null;
+}
+
+// Acumula upserts y los aplica en lotes (200) en vez de uno por chunk.
+const pendingSyncRows = [];
+
+async function flushSyncState() {
+  if (pendingSyncRows.length === 0) return;
+  const db = getSupabase();
+  for (let i = 0; i < pendingSyncRows.length; i += 200) {
+    const { error } = await db
+      .from("rag_sync_state")
+      .upsert(pendingSyncRows.slice(i, i + 200), { onConflict: "source_type,source_id,chunk_index" });
+    if (error) console.error("[RAG] sync-state flush:", error.message);
+  }
+  pendingSyncRows.length = 0;
 }
 
 async function saveSyncState(sourceType, sourceId, chunkIndex, pineconeId, hash) {
-  const db = getSupabase();
-  await db.from("rag_sync_state").upsert(
-    {
-      source_type: sourceType,
-      source_id: sourceId,
-      chunk_index: chunkIndex,
-      pinecone_id: pineconeId,
-      content_hash: hash,
-      synced_at: new Date().toISOString(),
-    },
-    { onConflict: "source_type,source_id,chunk_index" }
-  );
+  // Refleja en el cache para dedup dentro de la misma corrida.
+  const map = await loadSyncStateMap(sourceType);
+  map.set(`${sourceId}:${chunkIndex}`, { content_hash: hash });
+  pendingSyncRows.push({
+    source_type: sourceType,
+    source_id: sourceId,
+    chunk_index: chunkIndex,
+    pinecone_id: pineconeId,
+    content_hash: hash,
+    synced_at: new Date().toISOString(),
+  });
+  if (pendingSyncRows.length >= 200) await flushSyncState();
 }
 
 async function deleteSyncState(sourceType, sourceId) {
@@ -82,25 +115,31 @@ async function fetchBookmarks(options = {}) {
   const db = getSupabase();
   const { limit = 100, offset = 0, since = null, userId = null } = options;
 
-  let query = db
-    .from("bookmarks")
-    .select(
-      "id, tweet_id, text_content, author_username, author_name, source_url, links, first_comment_links, created_at"
-    )
-    .order("created_at", { ascending: false })
-    .range(offset, offset + limit - 1);
+  // Supabase capa cada request a 1000 filas: paginar hasta cubrir `limit`.
+  const all = [];
+  const pageSize = 1000;
+  let from = offset;
+  while (all.length < limit) {
+    const to = Math.min(from + pageSize, offset + limit) - 1;
+    let query = db
+      .from("bookmarks")
+      .select(
+        "id, tweet_id, text_content, author_username, author_name, source_url, links, first_comment_links, created_at"
+      )
+      .order("created_at", { ascending: false })
+      .range(from, to);
 
-  if (userId) {
-    query = query.eq("user_id", userId);
+    if (userId) query = query.eq("user_id", userId);
+    if (since) query = query.gte("updated_at", since);
+
+    const { data, error } = await query;
+    if (error) throw error;
+    const rows = data || [];
+    all.push(...rows);
+    if (rows.length < to - from + 1) break; // agotado
+    from = to + 1;
   }
-
-  if (since) {
-    query = query.gte("updated_at", since);
-  }
-
-  const { data, error } = await query;
-  if (error) throw error;
-  return data || [];
+  return all;
 }
 
 export async function ingestBookmarks(options = {}) {
@@ -121,6 +160,9 @@ export async function ingestBookmarks(options = {}) {
     const batch = bookmarks.slice(i, i + BATCH_SIZE);
     const vectors = [];
 
+    // Pasada 1: junta los chunks que faltan; pasada 2: UNA llamada de
+    // embeddings por lote (antes: una llamada OpenAI por chunk).
+    const work = [];
     for (const bookmark of batch) {
       try {
         const content = buildBookmarkContent(bookmark);
@@ -128,35 +170,12 @@ export async function ingestBookmarks(options = {}) {
         const chunks = chunkText(content);
 
         for (const [idx, chunk] of chunks.entries()) {
-          const pineconeId = `bookmark_${bookmark.id}_chunk_${idx}`;
-
-          // Check if already synced with same content
           const existing = await getSyncState("bookmark", bookmark.id, idx);
           if (existing && existing.content_hash === hash) {
             skipped++;
             continue;
           }
-
-          const [embedding] = await getEmbeddings([chunk.text]);
-
-          vectors.push({
-            id: pineconeId,
-            values: embedding,
-            metadata: {
-              source_type: "bookmark",
-              item_id: bookmark.id,
-              title: sanitizeForPinecone(deriveBookmarkTitle(bookmark)),
-              url: sanitizeForPinecone(bookmark.source_url || ""),
-              author: sanitizeForPinecone(bookmark.author_username || ""),
-              text: sanitizeForPinecone(chunk.text.slice(0, 1000)),
-              chunk_index: idx,
-              tags: extractBookmarkTags(bookmark),
-              created_at: bookmark.created_at || new Date().toISOString(),
-            },
-          });
-
-          await saveSyncState("bookmark", bookmark.id, idx, pineconeId, hash);
-          ingested++;
+          work.push({ bookmark, idx, text: chunk.text, hash });
         }
 
         if (verbose) {
@@ -170,12 +189,42 @@ export async function ingestBookmarks(options = {}) {
       }
     }
 
+    if (work.length > 0) {
+      try {
+        const embeddings = await getEmbeddings(work.map((w) => w.text));
+        for (const [j, w] of work.entries()) {
+          const pineconeId = `bookmark_${w.bookmark.id}_chunk_${w.idx}`;
+          vectors.push({
+            id: pineconeId,
+            values: embeddings[j],
+            metadata: {
+              source_type: "bookmark",
+              item_id: w.bookmark.id,
+              title: sanitizeForPinecone(deriveBookmarkTitle(w.bookmark)),
+              url: sanitizeForPinecone(w.bookmark.source_url || ""),
+              author: sanitizeForPinecone(w.bookmark.author_username || ""),
+              text: sanitizeForPinecone(w.text.slice(0, 1000)),
+              chunk_index: w.idx,
+              tags: extractBookmarkTags(w.bookmark),
+              created_at: w.bookmark.created_at || new Date().toISOString(),
+            },
+          });
+          await saveSyncState("bookmark", w.bookmark.id, w.idx, pineconeId, w.hash);
+          ingested++;
+        }
+      } catch (err) {
+        errors += work.length;
+        console.error(`[RAG] Error embedding batch:`, err.message);
+      }
+    }
+
     // Upsert batch to Pinecone
     if (vectors.length > 0) {
       await upsertVectors(vectors);
     }
   }
 
+  await flushSyncState();
   const stats = await getPineconeStats();
   console.log(`[RAG] Bookmark ingestion complete: ${ingested} ingested, ${skipped} skipped, ${errors} errors`);
   console.log(`[RAG] Pinecone total vectors: ${stats.totalVectorCount || "unknown"}`);
@@ -290,6 +339,7 @@ export async function ingestReadmes(options = {}) {
     }
   }
 
+  await flushSyncState();
   const stats = await getPineconeStats();
   console.log(`[RAG] README ingestion complete: ${ingested} ingested, ${skipped} skipped, ${errors} errors`);
   console.log(`[RAG] Pinecone total vectors: ${stats.totalVectorCount || "unknown"}`);
