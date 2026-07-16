@@ -41,3 +41,10 @@ jobs:
 
       - name: Ingest bookmarks + readmes into Pinecone
         run: node src/rag-ingest.js all
+
+      - name: Report dense bookmarks missing repo links
+        # Solo observabilidad: lista los "densos" (cue tipo "REPOOO👇") que
+        # siguen sin link de GitHub en links/first_comment_links. La
+        # recuperación corre en la extensión indexbook (re-lookup + PATCH
+        # /api/bookmarks/first-comment-links). El script nunca sale != 0.
+        run: node scripts/report-dense-missing-links.js --user=local-user --limit=100
