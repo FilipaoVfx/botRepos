@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+import fs from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 import {
   upsertVectors,
@@ -227,7 +228,7 @@ export async function ingestBookmarks(options = {}) {
   await flushSyncState();
   const stats = await getPineconeStats();
   console.log(`[RAG] Bookmark ingestion complete: ${ingested} ingested, ${skipped} skipped, ${errors} errors`);
-  console.log(`[RAG] Pinecone total vectors: ${stats.totalVectorCount || "unknown"}`);
+  console.log(`[RAG] Pinecone total vectors: ${stats.totalRecordCount ?? stats.totalVectorCount ?? "unknown"}`);
 
   return { ingested, skipped, errors, total: bookmarks.length };
 }
@@ -342,7 +343,7 @@ export async function ingestReadmes(options = {}) {
   await flushSyncState();
   const stats = await getPineconeStats();
   console.log(`[RAG] README ingestion complete: ${ingested} ingested, ${skipped} skipped, ${errors} errors`);
-  console.log(`[RAG] Pinecone total vectors: ${stats.totalVectorCount || "unknown"}`);
+  console.log(`[RAG] Pinecone total vectors: ${stats.totalRecordCount ?? stats.totalVectorCount ?? "unknown"}`);
 
   return { ingested, skipped, errors, total: readmes.length };
 }
@@ -379,15 +380,29 @@ const userArg = args.find((a) => a.startsWith("--user="));
 const userId = userArg ? userArg.slice("--user=".length) : (process.env.INGEST_USER_ID || null);
 
 try {
+  let summary;
   if (command === "bookmarks") {
-    await ingestBookmarks({ limit: 2000, verbose: true, userId });
+    summary = { bookmarks: await ingestBookmarks({ limit: 2000, verbose: true, userId }) };
   } else if (command === "readmes") {
-    await ingestReadmes({ limit: 500, verbose: true });
+    summary = { readmes: await ingestReadmes({ limit: 500, verbose: true }) };
   } else if (command === "all") {
-    await ingestAll({ verbose: true });
+    summary = await ingestAll({ verbose: true });
   } else {
     console.log("Usage: node rag-ingest.js [bookmarks|readmes|all] [--user=<id>]");
     process.exit(1);
+  }
+
+  // Resumen para ops/ingest.sh (last-ingest.json) cuando corre desde el timer.
+  if (process.env.INGEST_SUMMARY_FILE) {
+    fs.writeFileSync(process.env.INGEST_SUMMARY_FILE, JSON.stringify(summary));
+  }
+
+  // Errores parciales (chunks que no se pudieron embeddear/subir) salen con 2:
+  // así el timer de systemd marca la corrida como fallida y dispara la alerta.
+  const errors = Object.values(summary).reduce((n, r) => n + (r?.errors || 0), 0);
+  if (errors > 0) {
+    console.error(`[RAG] Ingestion finished with ${errors} errors`);
+    process.exit(2);
   }
 } catch (err) {
   console.error("[RAG] Ingestion failed:", err);

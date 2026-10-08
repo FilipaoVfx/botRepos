@@ -1,0 +1,10 @@
+[Unit]
+Description=botRepos: ingesta RAG cada 6 h (00:15, 06:15, 12:15, 18:15 Bogotá)
+
+[Timer]
+OnCalendar=*-*-* 00/6:15:00 America/Bogota
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

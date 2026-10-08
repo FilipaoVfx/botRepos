@@ -1,14 +1,15 @@
 name: RAG auto-ingest
 
-# Indexa en Pinecone lo nuevo cada 6h:
+# Indexa en Pinecone lo nuevo:
 #  1) baja READMEs pendientes (github_repo_readmes: pending/error -> ok)
 #  2) rag-ingest all: embeddings de bookmarks + readmes nuevos (dedup por
 #     content_hash en rag_sync_state; lo ya indexado se salta, costo ~0)
-# Disparo manual: pestaña Actions -> RAG auto-ingest -> Run workflow.
+# La ingesta programada corre en el VPS (ops/botrepos-ingesta.timer, cada 6 h):
+# GitHub desactiva los cron de repos sin commits en 60 días. Este workflow queda
+# solo como respaldo manual: pestaña Actions -> RAG auto-ingest -> Run workflow.
+# No lo dispares mientras corre el del VPS (no comparten lock).
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"
   workflow_dispatch: {}
 
 concurrency:

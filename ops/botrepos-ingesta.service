@@ -1,0 +1,16 @@
+[Unit]
+Description=botRepos: ingesta RAG (READMEs pendientes + embeddings → Pinecone + Trust Score)
+After=network-online.target
+Wants=network-online.target
+OnFailure=botrepos-alerta@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/botRepos
+EnvironmentFile=-/root/botRepos/.env
+StateDirectory=botrepos
+ExecStart=/root/botRepos/ops/ingest.sh
+Nice=10
+MemoryMax=400M
+TimeoutStartSec=45min
+# Instalar: ver DEPLOY.md §12

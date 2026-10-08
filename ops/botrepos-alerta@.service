@@ -1,0 +1,8 @@
+[Unit]
+Description=botRepos: alerta por Telegram de fallo en %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/botRepos
+ExecStart=/root/botRepos/ops/alerta.sh %i
+# Instalar: ver DEPLOY.md §12 (cp ops/botrepos-*.service ops/botrepos-*.timer /etc/systemd/system/)
