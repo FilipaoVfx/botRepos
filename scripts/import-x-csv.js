@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ quiet: true });
 
 import fs from "node:fs";
 import { createClient } from "@supabase/supabase-js";

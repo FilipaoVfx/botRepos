@@ -1,11 +1,11 @@
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ quiet: true });
 
 import { createClient } from "@supabase/supabase-js";
 import { queryVectors } from "./rag-pinecone.js";
 import { getEmbeddingDetailed } from "./rag-openai.js";
 import { fetchTweetMetrics, tweetIdFromUrl } from "./x-metrics.js";
-import { fetchRepoStars } from "./github-stars.js";
+import { fetchRepoInfo } from "./github-stars.js";
 import {
   spoolEvent,
   flushEvents,
@@ -252,21 +252,30 @@ export async function getRepoDetail(slug) {
 
   if (error || !repo) return null;
 
-  const [origins, engagement] = await Promise.all([
+  const [origins, engagement, githubMap] = await Promise.all([
     findRepoOrigins(slug, repo.repo_url),
     getTrustScore(slug),
+    getGithubScores([slug]),
   ]);
-  repo.trust_score = engagement ? Number(engagement.trust_score) : null;
-  return { repo, origins, engagement };
+  const github = githubMap.get(slug) || null;
+  const eff = effectiveTrust(engagement, github);
+  repo.trust_score = eff.score;
+  repo.trust_source = eff.source;
+  return { repo, origins, engagement, github };
 }
 
-// TTL de las stars: pasado esto, el bot dispara un refresh en segundo plano.
+// TTL de las señales de GitHub: pasado esto, el bot dispara un refresh en
+// segundo plano (y backfill-trust --stale-only las considera vencidas).
 export const STARS_TTL_MS = Number(process.env.STARS_TTL_MS) || 12 * 60 * 60 * 1000;
 
-// Refresca las stars de UN repo con el valor REAL de GitHub y lo persiste en
-// github_repo_readmes. Fire-and-forget desde el bot: el render ya mostró el
-// valor cacheado, esto sólo lo actualiza para la próxima apertura.
-export async function refreshRepoStars(slug) {
+// Refresca las señales de GitHub de UN repo con valores REALES de la API y las
+// persiste:
+//   - github_repo_readmes.stars/stars_updated_at (lo que ya mostraba el detail)
+//   - github_repositories.stars/forks/pushed_at/metadata_fetched_at: la tabla de
+//     metadatos que mantiene el indexer; escribimos las mismas columnas con el
+//     mismo origen (API de GitHub), así el Trust Score de respaldo no envejece.
+// Fire-and-forget desde el bot: el render ya mostró el valor cacheado.
+export async function refreshRepoGithub(slug) {
   const db = getSupabase();
   const { data: repo } = await db
     .from("github_repo_readmes")
@@ -275,15 +284,25 @@ export async function refreshRepoStars(slug) {
     .single();
   if (!repo) return null;
 
-  const stars = await fetchRepoStars(repo.owner, repo.repo);
-  if (stars == null) return null; // fallo/rate-limit: no pisar el valor guardado
+  const info = await fetchRepoInfo(repo.owner, repo.repo);
+  if (!info) return null; // fallo/rate-limit: no pisar el valor guardado
 
-  const { error } = await db
-    .from("github_repo_readmes")
-    .update({ stars, stars_updated_at: new Date().toISOString() })
-    .eq("repo_slug", slug);
-  if (error) return null;
-  return stars;
+  const now = new Date().toISOString();
+  const [a, b] = await Promise.all([
+    db.from("github_repo_readmes").update({ stars: info.stars, stars_updated_at: now }).eq("repo_slug", slug),
+    db
+      .from("github_repositories")
+      .update({
+        stars: info.stars,
+        forks: info.forks,
+        pushed_at: info.pushed_at,
+        metadata_fetched_at: now,
+        updated_at: now,
+      })
+      .eq("repo_slug", slug),
+  ]);
+  if (a.error || b.error) return null;
+  return info;
 }
 
 // Find the bookmark(s) (origin posts) that referenced this repo.
@@ -468,6 +487,64 @@ export async function refreshRepoTrust(slug) {
   return row;
 }
 
+// ─── Trust Score de respaldo: señales de GitHub ───────────────────────
+// Solo ~26 repos tienen métricas de X; el resto usa este puntaje, calculado al
+// leer desde github_repositories (stars/forks/pushed_at). Escala 0.00–10.00,
+// calibrada para quedar cerca de la de X: en los 403 repos da p50 ≈ 6.8 y
+// p90 ≈ 8.9 (X: p50 7.6, p90 8.6). Detalle en trust_score.md.
+export const GITHUB_SCORE_VERSION = 1;
+
+export function computeGithubScore({ stars, forks, pushed_at, archived } = {}, now = Date.now()) {
+  const logN = (x, anchor) =>
+    Math.min(Math.log10(1 + Math.max(Number(x) || 0, 0)) / Math.log10(1 + anchor), 1);
+  const starsN = logN(stars, 200000); // 200k stars ≈ tope
+  const forksN = logN(forks, 50000); // 50k forks ≈ tope
+  // Actividad: push en los últimos 90 días = 1; cae lineal hasta 0 a los 2 años.
+  let activity = 0;
+  if (pushed_at) {
+    const days = (now - new Date(pushed_at).getTime()) / 86_400_000;
+    activity = days <= 90 ? 1 : Math.max(0, 1 - (days - 90) / (730 - 90));
+  }
+  let score = 10 * (0.6 * starsN + 0.2 * forksN + 0.2 * activity);
+  if (archived) score *= 0.5;
+  return Math.round(score * 100) / 100;
+}
+
+// Batch: Map(slug → { github_score, stars, forks, pushed_at, fetched_at }).
+export async function getGithubScores(slugs = []) {
+  const unique = [...new Set(slugs.filter(Boolean))];
+  if (!unique.length) return new Map();
+  const db = getSupabase();
+  const { data, error } = await db
+    .from("github_repositories")
+    .select("repo_slug, stars, forks, pushed_at, metadata_fetched_at")
+    .in("repo_slug", unique);
+  if (error) return new Map(); // no crítico: el repo se ve sin score
+  return new Map(
+    (data || [])
+      .filter((r) => r.metadata_fetched_at) // sin metadatos aún: no inventar un 0
+      .map((r) => [
+        r.repo_slug,
+        {
+          github_score: computeGithubScore(r),
+          stars: r.stars,
+          forks: r.forks,
+          pushed_at: r.pushed_at,
+          fetched_at: r.metadata_fetched_at,
+        },
+      ])
+  );
+}
+
+// Puntaje efectivo: X (impacto en la comunidad) manda; GitHub es el respaldo.
+function effectiveTrust(engagement, github) {
+  if (engagement && engagement.trust_score != null) {
+    return { score: Number(engagement.trust_score), source: "x" };
+  }
+  if (github) return { score: github.github_score, source: "github" };
+  return { score: null, source: null };
+}
+
 // Batch-fetch engagement metrics for a set of repo slugs → Map(slug → row).
 // One round-trip; missing repos simply aren't in the map.
 export async function getTrustScores(slugs = []) {
@@ -489,16 +566,22 @@ export async function getTrustScore(slug) {
   return (await getTrustScores([slug])).get(slug) || null;
 }
 
-// Attach `trust_score` (and the raw metrics under `engagement`) to a list of
-// repo-shaped objects. Non-destructive: repos without metrics get trust_score
-// = null. `slugOf` maps an item to its repo_slug.
+// Attach the effective `trust_score` + `trust_source` ("x" | "github" | null)
+// to a list of repo-shaped objects, with the raw rows under `engagement` (X) and
+// `github`. Non-destructive: repos without any signal get trust_score = null.
+// `slugOf` maps an item to its repo_slug.
 async function attachTrustScores(items, slugOf) {
   if (!items || !items.length) return items;
-  const scores = await getTrustScores(items.map(slugOf));
+  const slugs = items.map(slugOf);
+  const [scores, github] = await Promise.all([getTrustScores(slugs), getGithubScores(slugs)]);
   for (const it of items) {
-    const m = scores.get(slugOf(it));
-    it.trust_score = m ? Number(m.trust_score) : null;
-    it.engagement = m || null;
+    const m = scores.get(slugOf(it)) || null;
+    const g = github.get(slugOf(it)) || null;
+    const eff = effectiveTrust(m, g);
+    it.trust_score = eff.score;
+    it.trust_source = eff.source;
+    it.engagement = m;
+    it.github = g;
   }
   return items;
 }

@@ -9,7 +9,7 @@ import {
   startEventLog,
   refreshRepoTrust,
   TRUST_SCORE_VERSION,
-  refreshRepoStars,
+  refreshRepoGithub,
   STARS_TTL_MS,
 } from "./rag-orchestrator.js";
 import { getPineconeStats, getPineconeConfig } from "./rag-pinecone.js";
@@ -50,14 +50,15 @@ function idForSlug(slug) {
   return id;
 }
 
-// Trust Score badge — a compact reliability marker shown next to a repo. Only
-// rendered when the repo has engagement metrics; degrades to "" otherwise, so
-// repos without a score (or before the CSV import) render cleanly.
-function trustBadge(score) {
+// Trust Score badge — a compact reliability marker shown next to a repo, with
+// its source: "X" (engagement of the origin post) or "GH" (GitHub fallback:
+// stars/forks/activity). Degrades to "" when the repo has no signal at all.
+function trustBadge(score, source) {
   if (score == null || Number.isNaN(Number(score))) return "";
   const s = Number(score);
   const icon = s >= 8 ? "🟢" : s >= 6 ? "🔵" : s >= 4 ? "🟡" : s >= 2 ? "🟠" : "⚪";
-  return ` · ${icon} ${s.toFixed(1)}/10`;
+  const src = source === "x" ? " · X" : source === "github" ? " · GH" : "";
+  return ` · ${icon} ${s.toFixed(1)}/10${src}`;
 }
 
 // Escape the few characters that break Telegram legacy Markdown.
@@ -188,7 +189,7 @@ async function buildReposPage(page) {
       const url = r.repo_url || `https://github.com/${r.repo_slug}`;
       text += `*${n}.* [${escapeMd(r.repo_slug)}](${url})\n`;
       const chars = r.content_chars ? `📝 ${r.content_chars} chars` : "";
-      const meta = `${chars}${trustBadge(r.trust_score)}`.replace(/^ · /, "");
+      const meta = `${chars}${trustBadge(r.trust_score, r.trust_source)}`.replace(/^ · /, "");
       if (meta) text += `      ${meta}\n`;
       detailRow.push({
         text: `🔎 ${i + 1}`,
@@ -223,7 +224,7 @@ function buildRepoSearchText(results) {
     const score = (r.score * 100).toFixed(0);
     text +=
       `📦 *${i + 1}.* [${escapeMd(r.repo_slug)}](${r.url})\n` +
-      `      📊 ${score}% relevancia${trustBadge(r.trust_score)}\n\n`;
+      `      📊 ${score}% relevancia${trustBadge(r.trust_score, r.trust_source)}\n\n`;
   });
 
   return text;
@@ -239,7 +240,7 @@ function buildRepoSearchKeyboard(results) {
 
 // ─── Repos: detail (metadata + origin post) ──────────────────────────
 
-function buildRepoDetail({ repo, origins, engagement }) {
+function buildRepoDetail({ repo, origins, engagement, github }) {
   const url = repo.repo_url || `https://github.com/${repo.repo_slug}`;
 
   let text =
@@ -259,14 +260,25 @@ function buildRepoDetail({ repo, origins, engagement }) {
     text += `📅 Indexado: ${new Date(repo.fetched_at).toLocaleDateString("es-ES")}\n`;
   }
 
-  // Trust Score — solo si el repo tiene métricas de engagement.
-  if (repo.trust_score != null && engagement) {
+  // Trust Score: el efectivo arriba; debajo, el desglose de cada fuente que exista.
+  if (repo.trust_score != null) {
+    text += `📊 *Impacto:*${trustBadge(repo.trust_score, repo.trust_source)}\n`;
+  }
+  if (engagement) {
     text +=
-      `📊 *Impacto:*${trustBadge(repo.trust_score)}\n` +
-      `      ❤️ ${Math.round(engagement.avg_likes)} likes · ` +
+      `      X: ❤️ ${Math.round(engagement.avg_likes)} likes · ` +
       `🔖 ${Math.round(engagement.avg_saves)} saves · ` +
       `📈 ${Number(engagement.avg_engagement_rate).toFixed(1)}% eng · ` +
       `🔁 ${engagement.mentions_count} menciones\n`;
+  }
+  if (github) {
+    const pushed = github.pushed_at
+      ? new Date(github.pushed_at).toLocaleDateString("es-ES")
+      : "?";
+    text +=
+      `      GH: ${github.github_score.toFixed(1)}/10 · ` +
+      `🍴 ${Number(github.forks || 0).toLocaleString("es-ES")} forks · ` +
+      `🕒 último push ${pushed}\n`;
   }
 
   text += "\n*📌 Post(s) de origen*\n";
@@ -461,14 +473,13 @@ export async function startTelegramBot() {
         (eng.updated_at && Date.now() - new Date(eng.updated_at).getTime() > TTL_MS);
       if (stale) refreshRepoTrust(slug).catch(() => {});
 
-      // Stars reales de GitHub: mismo patrón. El render ya mostró el valor
-      // persistido; refrescamos en segundo plano si falta o pasó el TTL.
-      const rd = detail.repo;
-      const starsStale =
-        rd.stars == null ||
-        !rd.stars_updated_at ||
-        Date.now() - new Date(rd.stars_updated_at).getTime() > STARS_TTL_MS;
-      if (starsStale) refreshRepoStars(slug).catch(() => {});
+      // Señales reales de GitHub (stars/forks/push): mismo patrón. El render ya
+      // mostró el valor persistido; refrescamos en segundo plano si falta o
+      // pasó el TTL.
+      const gh = detail.github;
+      const ghStale =
+        !gh?.fetched_at || Date.now() - new Date(gh.fetched_at).getTime() > STARS_TTL_MS;
+      if (ghStale) refreshRepoGithub(slug).catch(() => {});
     } catch (err) {
       ctx.reply(`❌ Error: ${err.message}`);
     }

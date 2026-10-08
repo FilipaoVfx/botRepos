@@ -1,5 +1,7 @@
-// Fetch REAL del número de stars de un repo de GitHub (nada sintético).
-// API pública: GET https://api.github.com/repos/{owner}/{repo} -> stargazers_count.
+// Fetch REAL de las señales de un repo de GitHub (nada sintético): stars, forks,
+// último push y si está archivado. Alimentan el detail y el Trust Score de
+// respaldo (computeGithubScore en rag-orchestrator.js).
+// API pública: GET https://api.github.com/repos/{owner}/{repo}.
 //
 // Performance: el detail NUNCA espera a GitHub — lee el valor persistido en la
 // DB y este módulo sólo refresca en segundo plano. Cache TTL en memoria + un
@@ -11,10 +13,10 @@ const FETCH_TIMEOUT_MS = Number(process.env.STARS_FETCH_TIMEOUT_MS) || 4000;
 const cache = new Map(); // "owner/repo" -> { v, t }
 
 /**
- * Devuelve el stargazers_count del repo, o null si falla / no existe.
- * @returns {Promise<number|null>}
+ * Señales del repo, o null si falla / no existe.
+ * @returns {Promise<{stars:number, forks:number, pushed_at:string|null, archived:boolean}|null>}
  */
-export async function fetchRepoStars(owner, repo) {
+export async function fetchRepoInfo(owner, repo) {
   const o = String(owner || "").trim();
   const r = String(repo || "").trim();
   if (!o || !r) return null;
@@ -48,6 +50,20 @@ export async function fetchRepoStars(owner, repo) {
   const stars = Number(j?.stargazers_count);
   if (!Number.isFinite(stars)) return null;
 
-  cache.set(key, { v: stars, t: Date.now() });
-  return stars;
+  const v = {
+    stars,
+    forks: Number(j.forks_count) || 0,
+    pushed_at: j.pushed_at || null,
+    archived: Boolean(j.archived),
+  };
+  cache.set(key, { v, t: Date.now() });
+  return v;
+}
+
+/**
+ * Devuelve el stargazers_count del repo, o null si falla / no existe.
+ * @returns {Promise<number|null>}
+ */
+export async function fetchRepoStars(owner, repo) {
+  return (await fetchRepoInfo(owner, repo))?.stars ?? null;
 }

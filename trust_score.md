@@ -58,6 +58,40 @@ al subirla, las filas viejas se marcan stale y se recomputan al abrir el detail.
 
 ---
 
+## Respaldo GitHub (cuando no hay métricas de X)
+
+Solo los repos cuyo post padre tiene métricas de X (vía scraper.tech) tienen el
+Trust Score "de comunidad". Para el resto se calcula un puntaje de respaldo con
+señales de GitHub, leídas de `github_repositories` (stars, forks, `pushed_at`),
+la tabla de metadatos que mantiene el indexer.
+
+```
+logN(x, a) = min( log10(1+x) / log10(1+a), 1 )
+actividad  = 1 si el último push fue hace ≤ 90 días; baja lineal hasta 0 a los 2 años
+
+github_score = 10 × ( 0.60 × logN(stars, 200000)
+                    + 0.20 × logN(forks,  50000)
+                    + 0.20 × actividad )  × (archivado ? 0.5 : 1)
+```
+
+- La fórmula vive en `computeGithubScore()` de `rag-orchestrator.js` y se versiona
+  con `GITHUB_SCORE_VERSION`. Se calcula al leer, así que no se guarda.
+- Calibración (2026-10-08): las anclas se eligieron para que la escala quede cerca
+  de la de X. En los 403 repos da p50 ≈ 6.8 y p90 ≈ 8.9; en los 26 con métricas de
+  X, el puntaje de X da p50 7.6 y p90 8.6.
+- **Puntaje efectivo:** se usa el de X si existe; si no, el de GitHub. El bot
+  muestra el origen en la insignia (`· X` o `· GH`) y el detalle del repo muestra
+  el desglose de ambas fuentes.
+- **Refresco:** `scripts/backfill-trust.js --stale-only` corre en cada ingesta
+  (`TRUST_REFRESH_LIMIT` repos por fuente). GitHub se considera vencido a las
+  12 h (`STARS_TTL_MS`) y X a los 7 días (`TRUST_X_TTL_DAYS`). Al abrir el detalle
+  de un repo, el bot también refresca en segundo plano lo que esté vencido.
+- **Backfill completo de X** (cuesta créditos de scraper.tech, una llamada por
+  post padre, ~430 en total):
+  `node scripts/backfill-trust.js --source=x --dry-run` y luego sin `--dry-run`.
+
+---
+
 ## Implementación por Fases
 
 ### Fase 0: Base de datos de métricas (YA)

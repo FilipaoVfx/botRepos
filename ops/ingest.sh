@@ -33,6 +33,7 @@ rm -f "$INGEST_SUMMARY_FILE"
 paso readmes node scripts/fetch-pending-readmes.js --limit=100
 paso ingesta node src/rag-ingest.js all
 paso densos  node scripts/report-dense-missing-links.js --user=local-user --limit=100
+paso trust   node scripts/backfill-trust.js --stale-only --source=all --limit="${TRUST_REFRESH_LIMIT:-40}"
 
 estado="ok"
 [ "${#fallos[@]}" -gt 0 ] && estado="error"

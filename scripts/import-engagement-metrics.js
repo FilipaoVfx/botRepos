@@ -17,7 +17,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { computeTrustScore, TRUST_SCORE_VERSION } from "../src/rag-orchestrator.js";
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 // ─── CSV parsing (RFC4180-ish: comillas, comas y "" escapadas) ───────
 function parseCsv(text) {
