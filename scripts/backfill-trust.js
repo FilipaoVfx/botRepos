@@ -33,6 +33,7 @@ const DRY_RUN = args.includes("--dry-run");
 const X_TTL_MS = (Number(process.env.TRUST_X_TTL_DAYS) || 7) * 86_400_000;
 const X_PAUSE_MS = Number(process.env.TRUST_X_PAUSE_MS) || 1500;
 const GH_PAUSE_MS = 250;
+const X_MAX_FAIL_STREAK = 10;
 
 if (!["x", "github", "all"].includes(SOURCE)) {
   console.error("Uso: --source=x|github|all");
@@ -90,15 +91,24 @@ async function backfillX() {
 
   let ok = 0;
   let fail = 0;
+  let streak = 0; // fallos seguidos: créditos agotados / clave revocada / caída
   for (const [i, t] of todo.entries()) {
+    let row = null;
     try {
-      const row = await refreshRepoTrust(t.slug);
-      if (row) ok++;
-      else fail++;
+      row = await refreshRepoTrust(t.slug);
       console.log(`[x] ${i + 1}/${todo.length} ${t.slug}: ${row ? row.trust_score : "sin datos"}`);
     } catch (err) {
-      fail++;
       console.log(`[x] ${i + 1}/${todo.length} ${t.slug}: error ${err.message}`);
+    }
+    if (row) {
+      ok++;
+      streak = 0;
+    } else {
+      fail++;
+      if (++streak >= X_MAX_FAIL_STREAK) {
+        console.log(`[x] ${streak} fallos seguidos: corto aquí (¿sin créditos en scraper.tech?)`);
+        break;
+      }
     }
     await sleep(X_PAUSE_MS);
   }
