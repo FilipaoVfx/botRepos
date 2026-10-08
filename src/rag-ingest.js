@@ -51,10 +51,15 @@ async function loadSyncStateMap(sourceType) {
   const pageSize = 1000;
   let from = 0;
   for (;;) {
+    // ORDER BY por la clave única: sin orden, Postgres no garantiza páginas
+    // estables y se saltaban filas → chunks ya indexados parecían nuevos y se
+    // re-embeddeaban (1.9k–2.7k por corrida, al azar).
     const { data, error } = await db
       .from("rag_sync_state")
       .select("source_id, chunk_index, content_hash")
       .eq("source_type", sourceType)
+      .order("source_id", { ascending: true })
+      .order("chunk_index", { ascending: true })
       .range(from, from + pageSize - 1);
     if (error) throw error;
     const rows = data || [];
