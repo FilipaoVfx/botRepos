@@ -1,0 +1,253 @@
+{
+ "_doc": "Set de evaluación de búsqueda (scripts/eval-search.js). labeled: consultas reales o de nombre con los repos correctos (un bookmark que enlaza a uno de esos repos también cuenta). unlabeled: consultas reales de events, para medir duplicados y relevancia baja.",
+ "labeled": [
+  {
+   "q": "git nexus",
+   "expect": [
+    "abhigyanpatwari/gitnexus"
+   ]
+  },
+  {
+   "q": "gitnexus",
+   "expect": [
+    "abhigyanpatwari/gitnexus"
+   ]
+  },
+  {
+   "q": "Open stock",
+   "expect": [
+    "open-dev-society/openstock"
+   ]
+  },
+  {
+   "q": "Meetily",
+   "expect": [
+    "zackriya-solutions/meetily"
+   ]
+  },
+  {
+   "q": "Paperclip",
+   "expect": [
+    "paperclipai/paperclip",
+    "paperclipai/companies"
+   ]
+  },
+  {
+   "q": "taste skill",
+   "expect": [
+    "leonxlnx/taste-skill"
+   ]
+  },
+  {
+   "q": "Playcanvas",
+   "expect": [
+    "playcanvas/supersplat"
+   ]
+  },
+  {
+   "q": "Santifer",
+   "expect": [
+    "santifer/cv-santiago",
+    "santifer/career-ops"
+   ]
+  },
+  {
+   "q": "Shibaki",
+   "expect": [
+    "abekyo/shibaki"
+   ]
+  },
+  {
+   "q": "Enetx",
+   "expect": [
+    "enetx/surf"
+   ]
+  },
+  {
+   "q": "Vansh",
+   "expect": [
+    "vansh-nagar/ascii-studio",
+    "vansh-nagar/pixel-perfect"
+   ]
+  },
+  {
+   "q": "carbonyl",
+   "expect": [
+    "fathyb/carbonyl"
+   ]
+  },
+  {
+   "q": "rustdesk",
+   "expect": [
+    "rustdesk/rustdesk"
+   ]
+  },
+  {
+   "q": "crewai",
+   "expect": [
+    "crewaiinc/crewai"
+   ]
+  },
+  {
+   "q": "openscreen",
+   "expect": [
+    "siddharthvaddem/openscreen"
+   ]
+  },
+  {
+   "q": "recordly",
+   "expect": [
+    "webadderallorg/recordly"
+   ]
+  },
+  {
+   "q": "trendradar",
+   "expect": [
+    "sansan0/trendradar"
+   ]
+  },
+  {
+   "q": "weclone",
+   "expect": [
+    "xming521/weclone"
+   ]
+  },
+  {
+   "q": "depthflow",
+   "expect": [
+    "brokensource/depthflow"
+   ]
+  },
+  {
+   "q": "ghost track",
+   "expect": [
+    "hunxbyts/ghosttrack"
+   ]
+  },
+  {
+   "q": "token tracker",
+   "expect": [
+    "mm7894215/tokentracker"
+   ]
+  },
+  {
+   "q": "grok pentest",
+   "expect": [
+    "neelsomani/grok-pentest"
+   ]
+  },
+  {
+   "q": "vulhunt",
+   "expect": [
+    "vulhunt-re/vulhunt"
+   ]
+  },
+  {
+   "q": "open drone map",
+   "expect": [
+    "opendronemap/odm"
+   ]
+  },
+  {
+   "q": "vibe trading",
+   "expect": [
+    "hkuds/vibe-trading"
+   ]
+  },
+  {
+   "q": "ltx desktop",
+   "expect": [
+    "lightricks/ltx-desktop"
+   ]
+  },
+  {
+   "q": "public apis",
+   "expect": [
+    "public-apis/public-apis"
+   ]
+  },
+  {
+   "q": "Hidrologia",
+   "expect": [
+    "ai-hydro/ai-hydro"
+   ]
+  },
+  {
+   "q": "Bot polymarket",
+   "expect": [
+    "ent0n29/polybot"
+   ]
+  },
+  {
+   "q": "Ahorrar tokens",
+   "expect": [
+    "alexgreensh/token-optimizer",
+    "nadimtuhin/claude-token-optimizer",
+    "ooples/token-optimizer-mcp",
+    "drona23/claude-token-efficient"
+   ]
+  },
+  {
+   "q": "edición de video",
+   "expect": [
+    "lightricks/ltx-desktop",
+    "siddharthvaddem/openscreen",
+    "webadderallorg/recordly"
+   ]
+  },
+  {
+   "q": "Generación de asci",
+   "expect": [
+    "vansh-nagar/ascii-studio"
+   ]
+  }
+ ],
+ "unlabeled": [
+  "Binance",
+  "Polymarket",
+  "Analytics",
+  "Pdfs",
+  "Multi-step flows",
+  "IA agents",
+  "whisper model",
+  "generación de artefactos",
+  "Mercado bursatil",
+  "Data anlytics",
+  "analitica de datos",
+  "Pocket manager",
+  "Wiki",
+  "Crear wiki",
+  "Sprites videojuegos",
+  "Scraper",
+  "saas",
+  "startup dies",
+  "Charts",
+  "Graficos",
+  "Bot WhatsApp",
+  "Twilio",
+  "Teléfono sip",
+  "Mejorar los textos de mi landing",
+  "Repositorios para hacer demos de mvps",
+  "Factura electrónica",
+  "Data science",
+  "Trading",
+  "Btc",
+  "react hooks patterns",
+  "trasncripcion youtube",
+  "ai agents tools",
+  "supabase auth",
+  "repo para pdf",
+  "Repo para svg",
+  "Repo para osint",
+  "Scrapear maps",
+  "Modelos chinos",
+  "Palantir",
+  "Ollama",
+  "Generación de imagen",
+  "Fine tuning",
+  "Free proxy",
+  "Hacking etico",
+  "Sergio fajardo",
+  "Node js"
+ ]
+}

@@ -291,6 +291,7 @@ Prueba: `node scripts/notify.js "prueba"`.
 
 Solo avisa en las **transiciones** (falla → "🔴 Problema", vuelve → "🟢 Recuperado");
 el estado vive en `/var/lib/botrepos/health.json`. `--dry-run` imprime sin avisar.
+Un `pm2 restart` manual también cuenta como reinicio y se avisa una vez.
 
 **Dashboard.** Escucha en `:8787` con token, pero el firewall solo abre 22/80/443.
 Para verlo, abre un túnel: `ssh -L 8787:localhost:8787 <usuario>@<servidor>` y

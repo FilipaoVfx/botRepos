@@ -132,6 +132,11 @@ function formatTelegramResults(results) {
     return response;
   }
 
+  if (results.lowRelevance) {
+    response +=
+      "⚠️ No encontré nada claramente relevante. Lo más cercano (baja relevancia):\n\n";
+  }
+
   results.results.forEach((r, i) => {
     const icon = r.source_type === "readme" ? "📦" : "🔖";
     const score = (r.score * 100).toFixed(0);
@@ -145,7 +150,7 @@ function formatTelegramResults(results) {
 
     const title = repoName || r.title.replace(/_/g, "\\_").replace(/\*/g, "\\*");
     response += `${icon} *${i + 1}. ${title}*\n`;
-    response += `   📊 ${score}% relevancia\n`;
+    response += `   📊 ${score}% relevancia${r.name_match ? " · 🎯 coincide el nombre" : ""}\n`;
 
     if (r.url) response += `   🔗 [Abrir enlace](${r.url})\n`;
     if (r.author && r.author !== repoName) response += `   👤 ${r.author}\n`;

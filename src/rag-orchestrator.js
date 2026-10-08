@@ -72,6 +72,7 @@ export async function ragSearch(query, options = {}) {
     sourceType = null,
     interface: iface = "api",
     user = null,
+    log = true, // false: no registra el evento (scripts/eval-search.js)
   } = options;
 
   const startedAt = Date.now();
@@ -81,23 +82,66 @@ export async function ragSearch(query, options = {}) {
   const emb = await getCachedEmbedding(query);
   const embeddingTime = Date.now() - tEmbed;
 
-  // 2. Query Pinecone
+  // 2. Query Pinecone. Pide más fragmentos de los que se muestran: varios suelen
+  // ser del mismo documento (un README largo ocupaba los 5 puestos).
   const tRetrieval = Date.now();
   const filter = sourceType ? { source_type: sourceType } : {};
-  const matches = await queryVectors(emb.embedding, { topK, filter });
+  const pool = Math.min(Math.max(topK * 4, 20), 40);
+  const [matches, named] = await Promise.all([
+    queryVectors(emb.embedding, { topK: pool, filter }),
+    !sourceType || sourceType === "readme" ? nameMatches(query) : [],
+  ]);
+
+  // 2b. Un resultado por documento: el mejor fragmento de cada uno.
+  const bestByDoc = new Map();
+  for (const m of matches) {
+    const key = `${m.metadata?.source_type}:${m.metadata?.item_id}`;
+    if (!bestByDoc.has(key) || m.score > bestByDoc.get(key).score) bestByDoc.set(key, m);
+  }
+
+  // 2c. Coincidencia de nombre ("gitnexus", "crewai", "Santifer"): ese README va
+  // primero aunque el vector lo deje abajo. Si no salió entre los candidatos,
+  // se trae su mejor fragmento con el mismo embedding (puntaje real, no inventado).
+  const namedIds = new Set();
+  for (const slug of named) {
+    let m = bestByDoc.get(`readme:${slug}`);
+    if (!m) {
+      [m] = await queryVectors(emb.embedding, { topK: 1, filter: { source_type: "readme", item_id: slug } });
+      if (!m) continue;
+      bestByDoc.set(`readme:${slug}`, m);
+    }
+    namedIds.add(m.id);
+  }
+  const docs = [...bestByDoc.values()].sort(
+    (a, b) => namedIds.has(b.id) - namedIds.has(a.id) || b.score - a.score
+  );
+
+  // 2d. Corte de relevancia: fuera lo que queda muy por debajo del mejor
+  // (REL_MARGIN) o del piso absoluto (MIN_SCORE). Si ni el mejor llega a
+  // LOW_SCORE, no hay nada claramente relevante: se muestran como mucho 2,
+  // marcados como baja relevancia. Calibrado con scripts/eval-search.js.
+  const topScore = docs.length ? Math.max(...docs.map((d) => d.score)) : 0;
+  const kept = docs.filter(
+    (d) => namedIds.has(d.id) || (d.score >= MIN_SCORE && d.score >= topScore - REL_MARGIN)
+  );
+  const lowRelevance = namedIds.size === 0 && topScore < LOW_SCORE;
+  const selected = kept.slice(0, lowRelevance ? Math.min(2, topK) : topK);
   const retrievalTime = Date.now() - tRetrieval;
 
   // 3. Enrich with Supabase data (batch)
-  const enriched = await batchEnrichResults(matches);
+  const enriched = await batchEnrichResults(selected);
+  for (const r of enriched) r.name_match = namedIds.has(r.pinecone_id);
 
   const responseTime = Date.now() - startedAt;
 
   // 4. Log event (fire-and-forget, non-blocking)
-  logEvent({
+  if (log) logEvent({
     interface: iface,
     user,
     query,
-    resultsCount: enriched.length,
+    // Baja relevancia cuenta como "sin resultados": así aparece en las brechas
+    // de contenido de /insights (las fuentes mostradas igual quedan en sources).
+    resultsCount: lowRelevance ? 0 : enriched.length,
     sources: enriched.map(sourceRef),
     responseTime,
     embeddingTime,
@@ -111,8 +155,64 @@ export async function ragSearch(query, options = {}) {
     query,
     results: enriched,
     total: enriched.length,
+    lowRelevance,
     latency_ms: responseTime,
   };
+}
+
+// Umbrales de relevancia (similitud coseno de text-embedding-3-small). Ver la
+// calibración en scripts/eval-search.js: los aciertos correctos quedaron como
+// mucho 0.07 por debajo del primero; consultas sin contenido real ("Sergio
+// fajardo") tienen el mejor resultado por debajo de 0.40.
+const MIN_SCORE = Number(process.env.MIN_SCORE) || 0.3;
+const REL_MARGIN = Number(process.env.REL_MARGIN) || 0.12;
+const LOW_SCORE = Number(process.env.LOW_SCORE) || 0.4;
+
+// ─── Coincidencia de nombre de repo ──────────────────────────────────
+
+const normName = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+
+// Índice de nombres de repos indexados, en memoria (~400 filas, TTL 10 min).
+let repoNameIndex = { at: 0, repos: [] };
+async function getRepoNameIndex() {
+  if (Date.now() - repoNameIndex.at < 10 * 60 * 1000) return repoNameIndex.repos;
+  const { data, error } = await getSupabase()
+    .from("github_repo_readmes")
+    .select("repo_slug, owner, repo")
+    .eq("status", "ok");
+  if (error) return repoNameIndex.repos; // no crítico: sigue solo con el vector
+  repoNameIndex = { at: Date.now(), repos: data || [] };
+  return repoNameIndex.repos;
+}
+
+// Slugs cuyo nombre coincide con la consulta (sin espacios, acentos ni signos):
+//   1) repo u owner/repo exacto ("git nexus" → abhigyanpatwari/gitnexus)
+//   2) owner exacto, si tiene ≤ 3 repos ("Santifer" → santifer/*)
+//   3) primer tramo de owner o repo ("Vansh" → vansh-nagar/*), si son ≤ 2
+// Solo consultas cortas (≤ 4 palabras, ≥ 4 caracteres): una frase no es un nombre.
+async function nameMatches(query) {
+  const q = normName(query);
+  if (q.length < 4 || String(query).trim().split(/\s+/).length > 4) return [];
+  const repos = await getRepoNameIndex();
+
+  const exact = repos.filter((r) => q === normName(r.repo) || q === normName(`${r.owner}${r.repo}`));
+  if (exact.length) return exact.slice(0, 3).map((r) => r.repo_slug);
+
+  const byOwner = repos.filter((r) => q === normName(r.owner));
+  if (byOwner.length && byOwner.length <= 3) return byOwner.map((r) => r.repo_slug);
+
+  if (q.length >= 5) {
+    const byToken = repos.filter((r) =>
+      [r.owner, r.repo].some((part) => normName(String(part).split(/[-_.]/)[0]) === q)
+    );
+    if (byToken.length && byToken.length <= 2) return byToken.map((r) => r.repo_slug);
+  }
+  return [];
 }
 
 // Compact, stable reference for an enriched result — stored in events.sources.

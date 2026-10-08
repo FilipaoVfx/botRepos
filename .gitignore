@@ -21,3 +21,7 @@ npm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Resultados de scripts/eval-search.js --save (se regeneran)
+eval/*.json
+!eval/queries.json
