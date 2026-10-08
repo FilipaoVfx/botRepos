@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-dotenv.config();
+dotenv.config({ quiet: true });
 
 // Envía una alerta de operación por Telegram al chat de OPS_CHAT_ID usando el
 // token del propio bot. Va directo a la Bot API (sin Telegraf) para no competir

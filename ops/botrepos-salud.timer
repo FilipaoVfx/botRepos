@@ -1,0 +1,10 @@
+[Unit]
+Description=botRepos: chequeo de salud cada 5 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

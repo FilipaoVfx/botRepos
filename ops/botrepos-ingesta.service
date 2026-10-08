@@ -13,4 +13,4 @@ ExecStart=/root/botRepos/ops/ingest.sh
 Nice=10
 MemoryMax=400M
 TimeoutStartSec=45min
-# Instalar: ver DEPLOY.md §12
+# Instalar: ver DEPLOY.md §14

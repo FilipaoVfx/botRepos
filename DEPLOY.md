@@ -156,20 +156,32 @@ El bot se reinicia solo si crashea o si el VPS se reinicia (gracias a
 
 ---
 
-## 9. Ingesta automática (cron)
+## 9. Ingesta automática (timer de systemd)
 
-Para mantener el índice al día, programa la ingesta con `cron`:
+La ingesta corre en el propio VPS cada 6 h (00:15, 06:15, 12:15 y 18:15, hora de
+Bogotá) con `ops/botrepos-ingesta.timer`. El script `ops/ingest.sh` hace los
+mismos pasos que tenía la GitHub Action:
+
+1. `scripts/fetch-pending-readmes.js`: baja los READMEs pendientes.
+2. `src/rag-ingest.js all`: embeddings nuevos → Pinecone (lo ya indexado se salta por `content_hash`).
+3. `scripts/report-dense-missing-links.js`: reporte de bookmarks "densos" sin link.
+4. `scripts/backfill-trust.js --stale-only`: refresca el Trust Score vencido.
+
+Usa `flock` para que no corran dos a la vez, deja el resultado en
+`/var/lib/botrepos/last-ingest.json` y sale con error si algún paso falla, lo
+que dispara la alerta por Telegram (§14). `rag-ingest.js` sale con código 2 si
+hubo errores parciales: antes un 429 de OpenAI dejaba READMEs sin indexar y la
+corrida igual salía "success".
+
+> La GitHub Action `RAG auto-ingest` quedó solo como disparo manual: GitHub
+> desactiva los `schedule` de repos sin commits en 60 días. No la lances
+> mientras corre la del VPS (no comparten el lock).
 
 ```bash
-crontab -e
+sudo systemctl start botrepos-ingesta.service     # ingesta ahora
+journalctl -u botrepos-ingesta -n 50 --no-pager    # ver la última corrida
+cat /var/lib/botrepos/last-ingest.json
 ```
-
-```cron
-# Cada día a las 4:00 AM — refresca el índice
-0 4 * * * cd /opt/botRepos && /usr/bin/node src/rag-ingest.js all >> /opt/botRepos/logs/ingest.log 2>&1
-```
-
-> Ajusta la ruta de `node` con `which node`.
 
 ---
 
@@ -237,3 +249,53 @@ journalctl -u telegram-rag-bot -f
 - Usa `SUPABASE_SERVICE_ROLE_KEY` **solo** en el servidor, nunca en clientes.
 - Rota las claves si alguna vez se filtran.
 - Considera un usuario dedicado (no root) para correr el bot en el VPS.
+
+---
+
+## 14. Operación en el VPS (salud, alertas, logs)
+
+Archivos en `ops/`:
+
+| Archivo | Qué hace |
+|---|---|
+| `botrepos-ingesta.{service,timer}` + `ingest.sh` | Ingesta cada 6 h (§9) |
+| `botrepos-salud.{service,timer}` + `scripts/healthcheck.js` | Chequeo de salud cada 5 min |
+| `botrepos-alerta@.service` + `alerta.sh` | Alerta por Telegram cuando una unidad falla (`OnFailure=`) |
+| `logrotate.botrepos` | Rotación semanal de `logs/*.log` (8 copias) |
+
+**Instalación** (una vez, desde la raíz del repo). Las unidades asumen el repo en
+`/root/botRepos`; si está en otra ruta, ajusta `WorkingDirectory`, `ExecStart` y
+`EnvironmentFile` antes de copiarlas.
+
+```bash
+sudo cp ops/botrepos-*.service ops/botrepos-*.timer /etc/systemd/system/
+sudo cp ops/logrotate.botrepos /etc/logrotate.d/botrepos
+sudo systemctl daemon-reload
+sudo systemctl enable --now botrepos-ingesta.timer botrepos-salud.timer
+systemctl list-timers | grep botrepos
+```
+
+**Alertas.** `scripts/notify.js` manda el mensaje con el token del propio bot al
+chat de `OPS_CHAT_ID` (tu user_id de Telegram; antes escríbele `/start` al bot).
+Sin `OPS_CHAT_ID` las alertas solo quedan en el journal.
+Prueba: `node scripts/notify.js "prueba"`.
+
+**Chequeo de salud.** `scripts/healthcheck.js` revisa:
+- PM2 (`telegram-rag-bot` online y si reinició)
+- `/healthz` del dashboard
+- Telegram `getMe`
+- Supabase y Pinecone
+- Antigüedad de la última ingesta (`INGEST_MAX_AGE_H`, 13 h)
+- RAM disponible (`MIN_AVAILABLE_MB`, 300)
+- Si el indexer dejó de traer bookmarks (`FRESHNESS_DAYS`, 14)
+
+Solo avisa en las **transiciones** (falla → "🔴 Problema", vuelve → "🟢 Recuperado");
+el estado vive en `/var/lib/botrepos/health.json`. `--dry-run` imprime sin avisar.
+
+**Dashboard.** Escucha en `:8787` con token, pero el firewall solo abre 22/80/443.
+Para verlo, abre un túnel: `ssh -L 8787:localhost:8787 <usuario>@<servidor>` y
+visita `http://localhost:8787/?token=<DASHBOARD_TOKEN>`.
+
+**Memoria.** `ecosystem.config.cjs` limita el heap a 192 MB y PM2 reinicia el
+proceso si pasa de 300 MB. Tras cambiar `node_args` hay que recrear el proceso:
+`pm2 delete telegram-rag-bot && pm2 start ecosystem.config.cjs && pm2 save`.

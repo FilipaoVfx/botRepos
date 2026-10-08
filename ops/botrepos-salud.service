@@ -1,0 +1,15 @@
+[Unit]
+Description=botRepos: chequeo de salud (PM2, Telegram, Supabase, Pinecone, ingesta, RAM) con alerta en transiciones
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/botRepos
+EnvironmentFile=-/root/botRepos/.env
+Environment=HOME=/root PM2_HOME=/root/.pm2
+StateDirectory=botrepos
+ExecStart=/usr/bin/node scripts/healthcheck.js
+Nice=10
+MemoryMax=200M
+TimeoutStartSec=2min
+# Sin OnFailure= a propósito: el script avisa por Telegram y siempre sale 0.
+# Instalar: ver DEPLOY.md §14

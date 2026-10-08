@@ -13,6 +13,9 @@ module.exports = {
       exec_mode: "fork",
       autorestart: true,
       watch: false,
+      // Heap acotado: el host va justo de RAM (servicios de botcentro). Con 192 MB
+      // de heap el proceso queda muy por debajo del tope de reinicio de 300 MB.
+      node_args: "--max-old-space-size=192",
       max_memory_restart: "300M",
       // Reinicio con backoff si crashea en bucle
       exp_backoff_restart_delay: 200,
