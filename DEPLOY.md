@@ -293,7 +293,12 @@ Solo avisa en las **transiciones** (falla → "🔴 Problema", vuelve → "🟢 
 el estado vive en `/var/lib/botrepos/health.json`. `--dry-run` imprime sin avisar.
 Un `pm2 restart` manual también cuenta como reinicio y se avisa una vez.
 
-**Dashboard.** Escucha en `:8787` con token, pero el firewall solo abre 22/80/443.
+**Dashboard.** Escucha en `:8787` con token y nginx lo publica como
+`https://<ip-con-guiones>.sslip.io/?token=<DASHBOARD_TOKEN>` (`ops/nginx.botrepos`).
+`sslip.io` resuelve el nombre a la IP del VPS, así Let's Encrypt emite el
+certificado sin dominio propio. Para instalarlo, sigue la cabecera de
+`ops/nginx.botrepos` y luego ejecuta `certbot --nginx -d <host> --redirect`.
+La alternativa sin exponer nada: el firewall solo abre 22/80/443.
 Para verlo, abre un túnel: `ssh -L 8787:localhost:8787 <usuario>@<servidor>` y
 visita `http://localhost:8787/?token=<DASHBOARD_TOKEN>`.
 
