@@ -73,9 +73,14 @@ function getHostMetrics() {
 }
 
 // ─── Metrics aggregator ──────────────────────────────────────────────
-async function collectMetrics() {
+// Ventanas que ofrece el selector del dashboard (?days=). Lista cerrada: el
+// endpoint es público vía túnel y no debe aceptar rangos arbitrarios.
+const WINDOW_DAYS = [1, 7, 30, 90, 365];
+
+async function collectMetrics({ days = 7 } = {}) {
+  const windowDays = WINDOW_DAYS.includes(days) ? days : 7;
   const [analytics, pm2, kb] = await Promise.all([
-    getQueryAnalytics({ windowDays: 7, topN: 10 }).catch((e) => ({ error: e.message })),
+    getQueryAnalytics({ windowDays, topN: 10 }).catch((e) => ({ error: e.message })),
     getPm2Metrics(),
     getKnowledgeStats().catch(() => null),
   ]);
@@ -96,6 +101,7 @@ function renderHtml() {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
 <title>botRepos · Monitor de Observabilidad</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
@@ -122,6 +128,7 @@ function renderHtml() {
 <header class="sticky top-0 z-20 flex flex-wrap items-center gap-3 px-6 py-4 border-b border-line bg-ink/90 backdrop-blur">
   <span id="dot" class="livedot w-2.5 h-2.5 rounded-full bg-good shadow-[0_0_10px] shadow-good"></span>
   <h1 class="text-[15px] font-semibold tracking-wide">botRepos · <span class="text-accent">MONITOR DE OBSERVABILIDAD</span></h1>
+  <div id="win" class="flex rounded-lg border border-line bg-panel2 p-0.5 text-xs" role="group" aria-label="Ventana de tiempo"></div>
   <div class="ml-auto flex flex-wrap gap-4 text-xs text-slate-400">
     <span>🖥️ <b id="host" class="text-slate-200">—</b></span>
     <span>refresh <b id="rf" class="text-slate-200">5s</b></span>
@@ -177,6 +184,7 @@ const fmtDur=s=>{if(s==null)return'—';const d=Math.floor(s/86400),h=Math.floor
 const ago=iso=>{const s=(Date.now()-new Date(iso))/1000;if(s<60)return Math.floor(s)+'s';
   if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';return Math.floor(s/86400)+'d';};
 const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const winLabel=d=>(WINDOWS.find(w=>w[0]===d)||[0,d+'d'])[1];
 const tone=(v,g,w)=>v>=g?'text-good':v>=w?'text-warn':'text-bad';        // higher = better
 const toneInv=(v,g,w)=>v<=g?'text-good':v<=w?'text-warn':'text-bad';      // lower = better
 const badge='inline-block text-[11px] px-2 py-0.5 rounded-full bg-panel2 text-slate-400 border border-line whitespace-nowrap';
@@ -186,9 +194,30 @@ function kpi(v,l,s,c){return \`<div class="rounded-xl border border-line bg-pane
   <div class="text-[11px] uppercase tracking-wide text-slate-400 mt-0.5">\${l}</div>
   <div class="text-[11px] text-slate-500 mt-1.5">\${s||''}</div></div>\`;}
 
+// El token llega en la URL (?token=); se reenvía en cabecera a la API. Antes el
+// fetch iba sin token y, con DASHBOARD_TOKEN configurado, el panel quedaba vacío.
+const QS=new URLSearchParams(location.search);
+const TOKEN=QS.get('token');
+const WINDOWS=[[1,'24h'],[7,'7d'],[30,'30d'],[90,'90d'],[365,'1 año']];
+let DAYS=Number(QS.get('days'))||(()=>{try{return Number(localStorage.getItem('days'))}catch(e){return 0}})()||7;
+if(!WINDOWS.some(w=>w[0]===DAYS))DAYS=7;
+
+function renderWin(){
+  document.getElementById('win').innerHTML=WINDOWS.map(([d,l])=>
+    \`<button data-d="\${d}" class="px-2.5 py-1 rounded-md \${d===DAYS?'bg-accent text-ink font-semibold':'text-slate-400 hover:text-slate-100'}">\${l}</button>\`).join('');
+}
+document.addEventListener('click',e=>{
+  const b=e.target.closest('#win button'); if(!b)return;
+  DAYS=Number(b.dataset.d);
+  try{localStorage.setItem('days',String(DAYS))}catch(e){}
+  QS.set('days',String(DAYS)); history.replaceState(null,'','?'+QS.toString());
+  renderWin(); tick();
+});
+
 async function tick(){
   try{
-    const r=await fetch('/api/metrics',{cache:'no-store'});
+    const r=await fetch('/api/metrics?days='+DAYS,{cache:'no-store',headers:TOKEN?{'x-dashboard-token':TOKEN}:{}});
+    if(!r.ok)throw new Error('HTTP '+r.status);
     render(await r.json());
     document.getElementById('dot').className='livedot w-2.5 h-2.5 rounded-full bg-good shadow-[0_0_10px] shadow-good';
     document.getElementById('upd').textContent=new Date().toLocaleTimeString('es-ES');
@@ -208,12 +237,12 @@ function render(d){
     const ph=rag.phases||{}, us=rag.usage||{};
     const fmtUsd=n=>n==null?'—':'$'+Number(n).toFixed(n<1?4:2);
     document.getElementById('kpis').innerHTML=[
-      kpi(fmtN(tot.last24h),'consultas 24h','1h: '+fmtN(tot.lastHour)+' · total: '+fmtN(tot.all),'text-accent'),
+      kpi(fmtN(tot.all),'consultas · '+winLabel(rag.windowDays),'24h: '+fmtN(tot.last24h)+' · 1h: '+fmtN(tot.lastHour),'text-accent'),
       kpi(sr+'%','tasa de éxito','resultados > 0',tone(sr,90,70)),
       kpi(fmtN(lat.avg)+'ms','latencia media','p95: '+fmtN(lat.p95)+'ms',toneInv(lat.p95||0,3000,6000)),
-      kpi(fmtN(rag.uniqueUsers),'usuarios únicos','ventana '+fmtN(rag.windowDays)+'d','text-slate-300'),
+      kpi(fmtN(rag.uniqueUsers),'usuarios únicos','ventana '+winLabel(rag.windowDays),'text-slate-300'),
       kpi(fmtUsd(us.costAll),'coste embeddings','24h: '+fmtUsd(us.cost24h)+' · '+fmtN(us.tokens24h)+' tok/24h','text-slate-300'),
-      kpi(fmtN(z.last24h),'sin resultados 24h','total ventana: '+fmtN(z.total),z.last24h>0?'text-warn':'text-good'),
+      kpi(fmtN(z.total),'sin resultados · '+winLabel(rag.windowDays),'24h: '+fmtN(z.last24h),z.total>0?'text-warn':'text-good'),
       kpi(fmtN(ph.embeddingAvg)+' / '+fmtN(ph.retrievalAvg)+'ms','embed / retrieval','desglose de fases · llm: n/a','text-slate-300'),
       kpi(fmtN(kb.bookmarks)+' / '+fmtN(kb.readmes),'bookmarks / repos','base de conocimiento','text-slate-300'),
     ].join('');
@@ -268,7 +297,7 @@ function render(d){
 }
 
 document.getElementById('rf').textContent=(REFRESH/1000)+'s';
-tick();setInterval(tick,REFRESH);
+renderWin();tick();setInterval(tick,REFRESH);
 </script>
 </body>
 </html>`;
@@ -300,7 +329,7 @@ export function startDashboard({ port } = {}) {
 
     try {
       if (url.pathname === "/api/metrics") {
-        const data = await collectMetrics();
+        const data = await collectMetrics({ days: Number(url.searchParams.get("days")) || 7 });
         return send(200, "application/json", JSON.stringify(data));
       }
       if (url.pathname === "/" || url.pathname === "/dashboard") {

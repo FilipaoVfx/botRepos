@@ -1,0 +1,20 @@
+[Unit]
+Description=botRepos: túnel rápido de Cloudflare para el dashboard (URL nueva por Telegram en cada arranque)
+After=network-online.target pm2-root.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/botRepos
+EnvironmentFile=-/root/botRepos/.env
+StateDirectory=botrepos
+ExecStart=/root/botRepos/ops/tunel.sh
+Restart=always
+RestartSec=15
+MemoryMax=150M
+# Instalar (publica el dashboard en internet, protegido por DASHBOARD_TOKEN):
+#   cp ops/botrepos-tunel.service /etc/systemd/system/ && systemctl daemon-reload
+#   systemctl enable --now botrepos-tunel.service
+
+[Install]
+WantedBy=multi-user.target
